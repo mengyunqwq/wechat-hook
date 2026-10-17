@@ -64,29 +64,31 @@ inline std::wstring g_MyDir;
 
 inline HttpServer* g_httpServer = nullptr;
 
-inline constexpr uint64_t g_Patch_Revoke = 0x22D09E7;
+inline uint64_t g_Patch_Revoke = 0x22D09E7;                      // 可被 offset_resolver 覆盖
+inline uint64_t g_xlogHookTarget = 0x108678;                     // xlog 钩子目标（原来硬编码在 inline_weixin_dll_load.cpp）
+inline uint64_t g_xwechatMainClazz = 0xA83AB20;                  // 主类对象地址
 
 
-constexpr size_t XWECHAT_SQLITE3_VFS_OFFSET = 0xA6C0490;
-constexpr size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x8BB0D38;
-constexpr size_t XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET = 0x8BB1570;
-constexpr size_t XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC = 0x4EE64D0;	//可以废弃不用
+inline size_t XWECHAT_SQLITE3_VFS_OFFSET = 0xA6C0490;            // 可被 offset_resolver 覆盖
+inline size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x8BB0D38;   // 可被覆盖
+inline size_t XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET = 0x8BB1570; // 可被覆盖
+inline size_t XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC = 0x4EE64D0;    // 可被覆盖	//可以废弃不用
 
 namespace offset
 {
-    inline constexpr uint64_t dec_pic_call = 0x493E70;
-    inline constexpr uint64_t create_param2 = 0xDF40;
-    inline constexpr uint64_t send_message = 0x1677A30;
-    inline constexpr uint64_t param1_vtable = 0x84EC9C8; 
+    inline uint64_t dec_pic_call = 0x493E70;
+    inline uint64_t create_param2 = 0xDF40;
+    inline uint64_t send_message = 0x1677A30;
+    inline uint64_t param1_vtable = 0x84EC9C8; 
 
-    inline constexpr uint64_t param2 = 0xA0CE0B0;
-    inline constexpr uint64_t param2_1 = 0x8595F58;
-    inline constexpr uint64_t param2_2 = 0x8595E98; 
-    inline constexpr uint64_t param2_3 = 0x8595DD8; 
-    inline constexpr uintptr_t txt_message_ctr = 0x6B2C30; 
-    inline constexpr uintptr_t txt_message_vtbl = 0x8279358;
-    inline constexpr uint64_t img_msg_vtbl = 0x84F96B8; 
-    inline constexpr uint64_t img_msg_vtb2 = 0x84F9748;
+    inline uint64_t param2 = 0xA0CE0B0;
+    inline uint64_t param2_1 = 0x8595F58;
+    inline uint64_t param2_2 = 0x8595E98; 
+    inline uint64_t param2_3 = 0x8595DD8; 
+    inline uintptr_t txt_message_ctr = 0x6B2C30; 
+    inline uintptr_t txt_message_vtbl = 0x8279358;
+    inline uint64_t img_msg_vtbl = 0x84F96B8; 
+    inline uint64_t img_msg_vtb2 = 0x84F9748;
 }
 
 

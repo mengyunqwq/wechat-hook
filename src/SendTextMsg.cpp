@@ -27,8 +27,20 @@ void Route_SendTextMsg(httplib::Server& svr)
 
             std::string wxidorgid = reqJson.value("wxidorgid", "");
             std::string msg = reqJson.value("msg", "");
+            // 真 @：atlist 可以传字符串 "wxid1,wxid2"，也可以传数组 ["wxid1","wxid2"]
+            std::string atlist;
+            if (reqJson.contains("atlist")) {
+                if (reqJson["atlist"].is_array()) {
+                    for (auto& x : reqJson["atlist"]) {
+                        if (!atlist.empty()) atlist += ",";
+                        atlist += x.get<std::string>();
+                    }
+                } else if (reqJson["atlist"].is_string()) {
+                    atlist = reqJson["atlist"].get<std::string>();
+                }
+            }
 
-            WeixinSend::SendText(wxidorgid, msg);
+            WeixinSend::SendText(wxidorgid, msg, atlist);
 
 
             resp["ret"] = 0;

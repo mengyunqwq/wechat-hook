@@ -1,4 +1,7 @@
 #include "wx_send.h"
+#include <vector>
+#include <mutex>
+#include "MinHook.h"
 #include <windows.h>
 #include <string>
 #include <cstddef>
@@ -172,6 +175,204 @@ namespace WeixinSend
 
 
 #pragma pack(pop)
+
+    // ══════════════════════════════════════════════════════════════
+    //  结构体布局自动校验
+    //  目的：布局一旦被微信改掉，要"响亮地失败"，而不是静默发不出去。
+    // ══════════════════════════════════════════════════════════════
+    // 前向声明：structcheck::probe() 要用到它（定义在文件后面）
+    void BuildTextMessage(uint64_t*, const std::string&, const std::string&, const std::string&);
+
+    namespace structcheck {
+
+        struct OneCheck { std::string name, expected, actual; bool pass; };
+        std::mutex g_mtx;
+        std::vector<OneCheck> g_checks;
+        bool g_probed = false, g_probeOk = false, g_hookOk = false;
+        // 本次要发的内容（供真对象校验对比）
+        std::string g_lastText, g_lastRoom, g_lastAt;
+        // 真对象校验结果
+        bool g_liveChecked = false, g_liveOk = false;
+        std::string g_liveDetail;
+        int g_liveOkCount = 0, g_liveBadCount = 0;
+        int g_detourCalls = 0;              // detour 被调用的次数（无条件自增）
+        std::string g_probeHex;             // 探针对象关键区域的原始字节
+
+        inline bool inModule(const void* p) {
+            // 直接读 PE 头拿 SizeOfImage —— 避免依赖 psapi.h（包含顺序有坑）
+            uintptr_t base = (uintptr_t)g_hWeixinDll;
+            if (base == 0 || IsBadReadPtr((void*)base, 0x40)) return false;
+            uint32_t peOff = *(uint32_t*)(base + 0x3C);
+            if (peOff == 0 || IsBadReadPtr((void*)(base + peOff), 0x60)) return false;
+            if (*(uint32_t*)(base + peOff) != 0x00004550u) return false;   // PE magic
+            uint32_t sizeOfImage = *(uint32_t*)(base + peOff + 0x50);
+            if (sizeOfImage == 0) return false;
+            uintptr_t a = (uintptr_t)p;
+            return a >= base && a < base + sizeOfImage;
+        }
+
+        // 安全地把 WeixinString 读成 std::string（带长度/指针合法性保护）
+        inline std::string readWxStr(const WeixinString* s) {
+            if (s == nullptr) return "<null>";
+            if (s->length == 0) return "";
+            if (s->length > 8192) return "<bad length>";
+            const char* p = (s->cap == 0xF) ? s->inline_buf : s->heap_buf;
+            if (p == nullptr || IsBadReadPtr(p, (SIZE_T)s->length)) return "<bad ptr>";
+            return std::string(p, (size_t)s->length);
+        }
+
+        inline void add(const std::string& name, const std::string& exp, const std::string& act) {
+            OneCheck c;
+            c.name = name; c.expected = exp; c.actual = act; c.pass = (exp == act);
+            g_checks.push_back(c);
+            if (!c.pass) {
+                char buf[256];
+                sprintf_s(buf, "[structcheck] FAIL %s: 期望 %s，实际 %s\n", name.c_str(), exp.c_str(), act.c_str());
+                OutputDebugStringA(buf);
+            }
+        }
+
+        // ── ① 探针 ─────────────────────────────────────────────
+        void probe() {
+            std::lock_guard<std::mutex> lg(g_mtx);
+            if (g_probed) return;
+            g_probed = true;
+            g_checks.clear();
+
+            uintptr_t base = (uintptr_t)g_hWeixinDll;
+            std::vector<uint64_t> buf(0x768, 0);          // 8 字节对齐、已清零
+            BuildTextMessage(buf.data(), "probe_text", "probe_room", "probe_at");
+
+            // vtable 指针必须等于 offset::txt_message_vtbl，且该处确实像一张 vtable
+            uint64_t vt = buf[0];
+            add("vtable 指针", std::to_string(base + offset::txt_message_vtbl), std::to_string(vt));
+            uint64_t firstEntry = 0;
+            if (!IsBadReadPtr((void*)(uintptr_t)vt, 8)) firstEntry = *(uint64_t*)(uintptr_t)vt;
+            add("vtable 首项在模块内", "1", inModule((void*)(uintptr_t)firstEntry) ? "1" : "0");
+
+            // WeixinString 的 ABI 假设：cap 在 +0x18、length 在 +0x10、文本在 +0x00
+            uint8_t* p = (uint8_t*)buf.data();
+            struct Field { const char* name; size_t off; const char* want; };
+            Field fields[] = {
+                { "receiver@0x0B0", 0x0B0, "probe_room" },
+                { "content@0x708",  0x708, "probe_text" },
+                { "atlist@0x728",   0x728, "probe_at"   },
+            };
+            for (auto& f : fields) {
+                const WeixinString* ws = (const WeixinString*)(p + f.off);
+                add(std::string(f.name) + " 文本", f.want, readWxStr(ws));
+                add(std::string(f.name) + " cap=0xF", "15", std::to_string((unsigned long long)ws->cap));
+                add(std::string(f.name) + " length", std::to_string(strlen(f.want)), std::to_string((unsigned long long)ws->length));
+            }
+
+            // 关键区域原始字节（看清字符串到底落在哪个偏移）
+            {
+                char hx[1024]; hx[0] = 0;
+                for (size_t k = 0x0B0; k < 0x0B0 + 48; k++) sprintf_s(hx + strlen(hx), 8, "%02X ", p[k]);
+                g_probeHex = std::string("probeHex 转储 @0x0B0: ") + hx + " | @0x700: ";
+                for (size_t k = 0x700; k < 0x700 + 48; k++) sprintf_s(hx + strlen(hx), 8, "%02X ", p[k]);
+                g_probeHex += hx;
+            }
+
+            g_probeOk = true;
+            for (auto& c : g_checks) if (!c.pass) { g_probeOk = false; break; }
+
+            char msg[128];
+            sprintf_s(msg, "[structcheck] 探针结果：%s（共 %zu 项）\n", g_probeOk ? "通过" : "未通过", g_checks.size());
+            OutputDebugStringA(msg);
+        }
+
+        // ── ② 真对象校验（hook send_message）────────────────────
+        typedef void (*SendMessage_t)(uint64_t, uint64_t);
+        SendMessage_t g_origSendMessage = nullptr;
+
+        void inspectLive(uint64_t a1, uint64_t a2) {
+            // 参数链（与 SendText 里的构造一致）：arg1[1] -> data；data[1] -> TextMessage*
+            std::string wantText, wantRoom, wantAt;
+            {
+                std::lock_guard<std::mutex> lg(g_mtx);
+                wantText = g_lastText; wantRoom = g_lastRoom; wantAt = g_lastAt;
+            }
+            if (wantText.empty()) return;
+
+            if (IsBadReadPtr((void*)(uintptr_t)a1, 0x28)) { g_liveDetail = "arg1 不可读"; g_liveOk = false; g_liveChecked = true; return; }
+            uint64_t* data = (uint64_t*)((uint64_t*)a1)[1];
+            if (data == nullptr || IsBadReadPtr(data, 0x20)) { g_liveDetail = "data 不可读"; g_liveOk = false; g_liveChecked = true; return; }
+            TextMessage* m = (TextMessage*)data[1];
+            if (m == nullptr || IsBadReadPtr(m, sizeof(TextMessage))) { g_liveDetail = "TextMessage 不可读"; g_liveOk = false; g_liveChecked = true; return; }
+
+            std::string gotRoom = readWxStr(&m->receiver);
+            std::string gotText = readWxStr(&m->content);
+            std::string gotAt = readWxStr(&m->atlist);
+            bool ok = (gotRoom == wantRoom) && (gotText == wantText) && (wantAt.empty() || gotAt == wantAt);
+
+            std::lock_guard<std::mutex> lg(g_mtx);
+            g_liveChecked = true;
+            g_liveOk = ok;
+            if (ok) g_liveOkCount++; else g_liveBadCount++;
+            char buf[512];
+            sprintf_s(buf, "[structcheck] 真对象校验 %s：room=%s text=%s atlist=%s\n",
+                      ok ? "通过" : "未通过", gotRoom.c_str(), gotText.c_str(), gotAt.c_str());
+            g_liveDetail = buf;
+            OutputDebugStringA(buf);
+        }
+
+        void detourSendMessage(uint64_t a1, uint64_t a2) {
+            g_detourCalls++;   // 先无条件计数：为 0 就说明钩子压根没被调用
+            inspectLive(a1, a2);
+            if (g_origSendMessage) g_origSendMessage(a1, a2);
+        }
+
+        void installSendHook() {
+            if (g_hookOk || g_origSendMessage != nullptr) return;
+            MH_STATUS st = MH_Initialize();
+            if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return;
+            void* target = (void*)((uintptr_t)g_hWeixinDll + offset::send_message);
+            if (MH_CreateHook(target, (LPVOID)&detourSendMessage, (LPVOID*)&g_origSendMessage) != MH_OK) return;
+            if (MH_EnableHook(target) != MH_OK) { g_origSendMessage = nullptr; return; }
+            g_hookOk = true;
+            OutputDebugStringA("[structcheck] send_message 钩子已安装（发送时校验真实对象布局）\n");
+        }
+
+        inline void remember(const std::string& text, const std::string& room, const std::string& at) {
+            std::lock_guard<std::mutex> lg(g_mtx);
+            g_lastText = text; g_lastRoom = room; g_lastAt = at;
+        }
+
+        // 探针未通过 → 拒发（避免用错误的布局把微信弄崩）
+        bool allowsSend() {
+            std::lock_guard<std::mutex> lg(g_mtx);
+            return g_probeOk;
+        }
+
+        std::string reportJson() {
+            std::lock_guard<std::mutex> lg(g_mtx);
+            std::string j = "{\n";
+            j += "  \"probeRan\": " + std::string(g_probed ? "true" : "false") + ",\n";
+            j += "  \"probeOk\": " + std::string(g_probeOk ? "true" : "false") + ",\n";
+            j += "  \"advisoryOnly\": true,\n";
+            j += "  \"sendHookInstalled\": " + std::string(g_hookOk ? "true" : "false") + ",\n";
+            j += "  \"liveChecked\": " + std::string(g_liveChecked ? "true" : "false") + ",\n";
+            j += "  \"liveOk\": " + std::string(g_liveOk ? "true" : "false") + ",\n";
+            j += "  \"liveOkCount\": " + std::to_string(g_liveOkCount) + ",\n";
+            j += "  \"liveBadCount\": " + std::to_string(g_liveBadCount) + ",\n";
+            j += "  \"liveDetail\": \"" + g_liveDetail + "\",\n";
+            j += "  \"detourCalls\": " + std::to_string(g_detourCalls) + ",\n";
+            j += "  \"sendMessageOffset\": " + std::to_string((unsigned long long)offset::send_message) + ",\n";
+            j += "  \"hookTarget\": " + std::to_string((unsigned long long)((uintptr_t)g_hWeixinDll + offset::send_message)) + ",\n";
+            j += "  \"probeHex\": \"" + g_probeHex + "\",\n";
+            j += "  \"checks\": [\n";
+            for (size_t i = 0; i < g_checks.size(); i++) {
+                auto& c = g_checks[i];
+                j += "    {\"name\":\"" + c.name + "\",\"pass\":" + (c.pass ? "true" : "false")
+                   + ",\"expected\":\"" + c.expected + "\",\"actual\":\"" + c.actual + "\"}";
+                if (i + 1 < g_checks.size()) j += ",";
+                j += "\n";
+            }
+            j += "  ]\n}\n";
+            return j;
+        }
+    }
 
     // 新增: 设置 Unicode 字符串
     inline void SetWeixinStringU(WeixinStringUnicode* ws, const std::string& s)
@@ -406,7 +607,8 @@ namespace WeixinSend
 
 
 
-    void BuildTextMessage(uint64_t* ptr, const std::string& text, const std::string& wxid)
+    void BuildTextMessage(uint64_t* ptr, const std::string& text, const std::string& wxid,
+                          const std::string& atlist = std::string())
     {
         uintptr_t base = GetWeixinDllBase();
 
@@ -422,6 +624,13 @@ namespace WeixinSend
 
         SetWeixinString(&msg->receiver, wxid);
         SetWeixinString(&msg->content, text);
+        // ── 真 @ 的关键 ──
+        // atlist 里放被 @ 的人的 wxid（多个用英文逗号分隔）。
+        // 只有填了这个字段，被 @ 的人才会真的收到提醒（红点）；
+        // 只把 "@名字" 写进正文的话，对方是收不到提醒的（只是看着像 @）。
+        if (!atlist.empty()) {
+            SetWeixinString(&msg->atlist, atlist);
+        }
         msg->msg_len = text.length();
         msg->type = 1;
     }
@@ -470,13 +679,14 @@ namespace WeixinSend
         );
     }
 
-    void SendText(const std::string& wxidorgid, const std::string& msg)
+    void SendText(const std::string& wxidorgid, const std::string& msg,
+                  const std::string& atlist)
     {
         uintptr_t base = GetWeixinDllBase();
 
 		//不同版本需要调整 msgBuf 大小，过小会导致发送失败，过大会浪费内存 
         uint64_t* msgBuf = HeapAlloc_mb<uint64_t>(0x768);
-        BuildTextMessage(msgBuf, msg, wxidorgid);
+        BuildTextMessage(msgBuf, msg, wxidorgid, atlist);
 
         uint64_t* data = HeapAlloc_mb<uint64_t>(0x20);
         data[0] = (uint64_t)(msgBuf + 2);
@@ -498,6 +708,10 @@ namespace WeixinSend
     }
 
 
+
+    std::string StructCheckReportJson() {
+        return structcheck::reportJson();
+    }
 
     void DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path)
     {

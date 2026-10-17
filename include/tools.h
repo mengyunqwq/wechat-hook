@@ -1,3 +1,4 @@
+#include <windows.h>
 #pragma once
 #include <cstdint>
 #include <string>
@@ -69,3 +70,27 @@ std::string 编码_URL编码(const std::string& 欲编码的文本, bool 不编�
 uint64_t 到整数(std::string value);
 std::string 到文本(uint64_t value);
 uint64_t 右移(uint64_t value, int bits);
+
+
+// ── 判断一段内存是否真的可读（默认查 4KB）────────────────────────────
+// 不用 IsBadReadPtr 的原因：它只探测第一个字节，且不完整处理 PAGE_GUARD/NOACCESS。
+// 而我们要拿这些地址去调 sqlite3 API（会深入解引用），探测不够就会崩。
+inline bool IsReadableRegion(const void* p, size_t len = 0x1000) {
+    if (p == nullptr || len == 0) return false;
+    const unsigned char* cur = (const unsigned char*)p;
+    const unsigned char* end = cur + len;
+    int guard = 0;
+    while (cur < end && guard++ < 64) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cur, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+        if ((mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                            | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
+            return false;
+        const unsigned char* regionEnd = (const unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd <= cur) return false;
+        cur = regionEnd;
+    }
+    return cur >= end;
+}

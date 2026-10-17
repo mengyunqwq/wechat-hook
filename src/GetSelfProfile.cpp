@@ -27,6 +27,12 @@ void RegisterGetSelfProfile(httplib::Server& svr)
         {
             json resp;
 
+            // 双保险：能取到自己的 wxid 就说明已登录，顺手把标志置上
+            // （上游 g_IsLogin 永远为 0，导致 QueryDB 一直不可用）
+            if (!SelfInfo.wxid.empty()) {
+                g_IsLogin = 1;
+            }
+
             resp["wxid"] = SelfInfo.wxid;
             resp["alias"] = SelfInfo.alias;
             resp["nickname"] = SelfInfo.nickname;

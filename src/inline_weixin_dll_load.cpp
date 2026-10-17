@@ -10,6 +10,7 @@
 #include "Hook_Method.h"
 
 #include "global.h"
+#include "offset_resolver.h"
 #include <MinHook.h>
 #include "tools.h"
 #include "HookManager.h"
@@ -198,11 +199,18 @@ void Evt_WeixinLoad()
     if (!g_httpServer)
     {
         g_httpServer = new HttpServer();
-        g_httpServer->Start("0.0.0.0", g_StartPort);
+        // ⚠️ 安全：只监听本机回环地址。
+        // 原来写的是 "0.0.0.0" —— 那等于把 /SendTextMsg（以本账号发消息）、
+        // /QueryDB/execute（任意 SQL 读改微信数据库）暴露给**同一局域网内任何人**，且无鉴权。
+        // 接入层（wx-bridge）在同一台机器上，用 127.0.0.1 足够；
+        // 若确实需要远程访问，请自行加反向代理 + 鉴权，不要直接改回 0.0.0.0。
+        g_httpServer->Start("127.0.0.1", g_StartPort);
     }
 #ifdef _DEBUG
     //xLog 日志
-    Hook_Call(WeixinDll_Offset(0x108678), 5, hook::MyCallHandler_xLog);
+    // 启动时用特征模式重新定位所有偏移（微信升级后自动适配；失败则回退硬编码）
+        ResolveOffsets();
+        Hook_Call(WeixinDll_Offset(g_xlogHookTarget), 5, hook::MyCallHandler_xLog);
 #endif
     
 
