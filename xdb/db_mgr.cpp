@@ -1,6 +1,11 @@
 #include "db_mgr.h"
 #include <atomic>
 #include <chrono>
+#include <set>
+#include <string>
+#include <cstring>
+#include <cstdio>
+#include <intrin.h>   // _ReturnAddress()：识别 SQL 入口的调用来源
 #include "xwechat_offsets.h"
 #include "SundaySearch.h"
 #include "global.h"
@@ -35,6 +40,9 @@ namespace db_registry {
         return pos == std::string::npos ? p : p.substr(pos + 1);
     }
 
+    // 探针前置声明（实现在下面的 probe 命名空间里，这里只是让 open_v2 detour 能用）
+    namespace probe { inline void onOpen(const char* filename, int rc, void* db); }
+
     // 我们的 open_v2：先调原函数，成功就把句柄记下来
     int detourOpenV2(const char* filename, sqlite3** ppDb, int flags, const char* zVfs) {
         int rc = g_origOpenV2 ? g_origOpenV2(filename, ppDb, flags, zVfs) : 1 /*SQLITE_ERROR*/;
@@ -42,6 +50,9 @@ namespace db_registry {
             std::lock_guard<std::mutex> lg(g_mtx);
             g_opened[(LPVOID)*ppDb] = baseName(std::string(filename));
         }
+        // 探针：记录"这个 sqlite 实例打开过哪些库"（封顶 100 行）。
+        // 用途：判断 message_0.db 是不是同一个实例打开的 —— 这是区分"入口不同"和"另一个实例"的关键。
+        probe::onOpen(filename, rc, (ppDb != nullptr) ? (void*)*ppDb : nullptr);
         return rc;
     }
 
@@ -71,13 +82,563 @@ namespace db_registry {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    //  探针（第一轮：只观察不接管；第二轮：广谱 + 多入口 + 来源识别）
+    //
+    //  第一轮实测结论：消息写库**不经过** api->prepare（sqlite3_prepare_v2）——
+    //  PROBE-MSG / PROBE-WRITE 都是 0 条，但 prepare 钩子确实活着。
+    //  第二轮要回答：写库到底走哪个 SQL 入口，还是根本是另一个 sqlite 实例。
+    //
+    //  因此第二轮加三件事：
+    //    ① 调用来源识别（self=我们自己的 QueryDB / wx=Weixin.dll / other）。
+    //       没有这个，广谱日志根本读不了：bridge 轮询**本身就在查 message_0.db 的 Msg_ 表**
+    //       （`SELECT name FROM sqlite_master ... LIKE 'Msg_%'`、
+    //        `SELECT MAX(local_id) FROM Msg_xxx`、`SELECT ... FROM Msg_xxx ORDER BY local_id`），
+    //       所以"看到 SELECT ... Msg_"极可能是我方流量，不能当成"微信在读消息表"。
+    //    ② 广谱特征：前 40 条互不相同的语句（不管类型），带来源 + 入口名 + 目标表。
+    //    ③ 补齐其它 SQL 入口：prepare16_v2 / prepare_v3 / prepare16_v3 / exec
+    //       —— 全部来自同一张 g_api 表（sqlite3.h:164/336/338/146），同一套 MinHook 手法。
+    //       exec 内部会调 prepare_v2（SQLite legacy.c），所以 exec 与 prepare 会各记一行，属正常。
+    //
+    //  约束不变：不拦截、不改 rc/出参/控制流、不阻塞。
+    //  未命中路径的成本：一次 _ReturnAddress + 一次计数器自增 + O(1) 首词读取。
+    // ══════════════════════════════════════════════════════════════════
+    namespace probe {
+
+        enum class Kw { Other, Insert, Update, Delete, Replace };
+
+        // 日志出口：OutputDebugStringA + 追加到 <Weixin.exe 所在目录>\hook-probe.log
+        inline void sink(const std::string& line) {
+            OutputDebugStringA(line.c_str());
+            static std::mutex logMtx;
+            static HANDLE hLog = INVALID_HANDLE_VALUE;
+            static bool logTried = false;      // 开不了就只试一次，别每次重试
+            std::lock_guard<std::mutex> lg(logMtx);
+            if (hLog == INVALID_HANDLE_VALUE) {
+                if (logTried) return;
+                logTried = true;
+                std::string path = "D:\\wxhook\\hook-probe.log";
+                char exe[MAX_PATH] = { 0 };
+                if (GetModuleFileNameA(nullptr, exe, MAX_PATH) > 0) {
+                    std::string s(exe);
+                    auto p = s.find_last_of("\\/");
+                    if (p != std::string::npos) path = s.substr(0, p + 1) + "hook-probe.log";
+                }
+                hLog = CreateFileA(path.c_str(), FILE_APPEND_DATA,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hLog == INVALID_HANDLE_VALUE) return;
+                DWORD w = 0;
+                std::string hdr = "[probe] ---- session ---- log file = " + path + "\r\n";
+                WriteFile(hLog, hdr.data(), (DWORD)hdr.size(), &w, nullptr);
+            }
+            DWORD w = 0;
+            WriteFile(hLog, line.data(), (DWORD)line.size(), &w, nullptr);
+        }
+
+        inline std::string stamp() {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            char b[64];
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "%02d:%02d:%02d.%03d",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            return std::string(b);
+        }
+
+        inline std::string clip(const char* s, int len, size_t cap) {
+            if (s == nullptr) return "<null>";
+            std::string t(s, len < 0 ? strlen(s) : (size_t)len);
+            if (t.size() > cap) {
+                t.resize(cap);
+                t += "...<truncated>";
+            }
+            return t;
+        }
+
+        // ── 调用来源识别 ────────────────────────────────────────────────
+        // 我们自己的模块范围 / Weixin.dll 范围，在 arm() 里一次性算好，
+        // 热路径上只读这几个全局（无锁、无 API 调用）。
+        uint64_t g_selfBase = 0, g_selfEnd = 0, g_wxBase = 0, g_wxEnd = 0;
+
+        inline uint64_t peImageSize(uint64_t base) {
+            if (base == 0 || IsBadReadPtr((LPVOID)base, sizeof(IMAGE_DOS_HEADER))) return 0;
+            auto dos = (IMAGE_DOS_HEADER*)base;
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+            uint64_t ntAddr = base + (uint64_t)dos->e_lfanew;
+            if (IsBadReadPtr((LPVOID)ntAddr, sizeof(IMAGE_NT_HEADERS))) return 0;
+            auto nt = (IMAGE_NT_HEADERS*)ntAddr;
+            if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+            return (uint64_t)nt->OptionalHeader.SizeOfImage;
+        }
+
+        // caller = detour 入口处的 _ReturnAddress()（MinHook 用 jmp 进入 detour，
+        // 所以栈上的返回地址就是"原来那个调用者"）。off：self/wx 时是模块内偏移。
+        inline const char* callerClass(void* caller, uint64_t& off) {
+            uint64_t a = (uint64_t)caller;
+            if (g_selfEnd > g_selfBase && a >= g_selfBase && a < g_selfEnd) { off = a - g_selfBase; return "self"; }
+            if (g_wxEnd > g_wxBase && a >= g_wxBase && a < g_wxEnd) { off = a - g_wxBase; return "wx"; }
+            off = a;
+            return "other";
+        }
+
+        std::atomic<long long> g_cSelf{ 0 }, g_cWx{ 0 }, g_cOther{ 0 }, g_cTotal{ 0 };
+
+        // step 探针用的"最近见过的 stmt 指针"环形缓存（无锁、无分配）。
+        // step 是最热的函数，命中时只有一次 load + 比较，绝不做哈希/加锁/分配。
+        const size_t kStmtRing = 4096;
+        std::atomic<void*> g_stmtRing[kStmtRing];
+        inline bool stmtSeen(void* stmt) {
+            size_t idx = (((size_t)stmt) >> 4) % kStmtRing;
+            void* cur = g_stmtRing[idx].load(std::memory_order_relaxed);
+            if (cur == stmt) return true;
+            g_stmtRing[idx].store(stmt, std::memory_order_relaxed);
+            return false;
+        }
+
+        // 里程碑计数：每类第 1 次必记，另外 10/100/1000/... 各记一次；
+        // 再每 1000 次总调用打一行心跳。日志量有界，但"wx 到底有没有涨"绝不会漏。
+        inline void countCaller(const char* cls) {
+            long long n;
+            if (cls[0] == 's')      n = ++g_cSelf;
+            else if (cls[0] == 'w') n = ++g_cWx;
+            else                    n = ++g_cOther;
+            long long total = ++g_cTotal;
+            bool milestone = (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000);
+            bool heartbeat = (total % 1000 == 0);
+            if (milestone || heartbeat) {
+                char b[288];
+                _snprintf_s(b, sizeof(b), _TRUNCATE,
+                            "[PROBE-SUM] %s 累计 SQL 入口调用 self=%lld wx=%lld other=%lld（%s 第 %lld 次%s）\r\n",
+                            stamp().c_str(), g_cSelf.load(), g_cWx.load(), g_cOther.load(), cls, n,
+                            milestone ? "" : "，心跳");
+                sink(b);
+            }
+        }
+
+        // ── 极简 SQL 词法（只用来做"语句特征"，不做完整解析）──────────
+        inline bool identCh(char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_' || c == '$';
+        }
+        inline std::string upperOf(std::string s) {
+            for (auto& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            return s;
+        }
+        // 读 i 处的标识符（支持 "t" [t] `t`）；i 前进；读不到返回空且 i 不动
+        inline std::string readIdent(const char* sql, int limit, int& i) {
+            while (i < limit && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\r' || sql[i] == '\n')) ++i;
+            if (i >= limit) return "";
+            char c = sql[i];
+            if (c == '"' || c == '[' || c == '`') {
+                char close = (c == '[') ? ']' : c;
+                ++i;
+                size_t st = (size_t)i;
+                while (i < limit && sql[i] != close) ++i;
+                std::string r(sql + st, (size_t)i - st);
+                if (i < limit) ++i;
+                return r;
+            }
+            size_t st = (size_t)i;
+            while (i < limit && identCh(sql[i])) ++i;
+            return std::string(sql + st, (size_t)i - st);
+        }
+        // 找关键字（词边界、大小写不敏感）后面那个标识符
+        inline std::string findAfterKeyword(const char* sql, int limit, const char* kw) {
+            size_t klen = strlen(kw);
+            for (int i = 0; i + (int)klen <= limit; ++i) {
+                bool ok = true;
+                for (size_t k = 0; k < klen; ++k) {
+                    char a = sql[i + k];
+                    if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                    if (a != kw[k]) { ok = false; break; }
+                }
+                if (!ok) continue;
+                if (i > 0 && identCh(sql[i - 1])) continue;
+                int j = i + (int)klen;
+                if (j < limit && identCh(sql[j])) continue;
+                return readIdent(sql, limit, j);
+            }
+            return "";
+        }
+
+        // 从写语句里取出目标表名（不做完整 SQL 解析，够用即可；取不到返回空串）。
+        // 认 INSERT [OR ...] INTO t / REPLACE INTO t / UPDATE t / DELETE FROM t，
+        // 支持 "库名.表名"（取表名）、"t"/[t]/`t` 三种引号。
+        inline std::string targetTable(const char* sql, int n, Kw kw) {
+            if (sql == nullptr) return "";
+            int limit = (n < 0) ? 512 : (n < 512 ? n : 512);
+            int i = 0;
+            auto isWs = [&](int k) {
+                return k < limit && (sql[k] == ' ' || sql[k] == '\t' || sql[k] == '\r' || sql[k] == '\n');
+            };
+            auto skipWs = [&]() { while (isWs(i)) ++i; };
+            auto isIdent = [&](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '$';
+            };
+            auto word = [&]() -> std::string {
+                size_t s = (size_t)i;
+                while (i < limit && isIdent(sql[i])) ++i;
+                return std::string(sql + s, (size_t)i - s);
+            };
+            auto ident = [&]() -> std::string {
+                skipWs();
+                if (i >= limit) return "";
+                char c = sql[i];
+                if (c == '"' || c == '[' || c == '`') {
+                    char close = (c == '[') ? ']' : c;
+                    ++i;
+                    size_t s = (size_t)i;
+                    while (i < limit && sql[i] != close) ++i;
+                    std::string r(sql + s, (size_t)i - s);
+                    if (i < limit) ++i;
+                    return r;
+                }
+                return word();
+            };
+            auto upper = [](std::string s) {
+                for (auto& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+                return s;
+            };
+            (void)word();
+            if (kw == Kw::Update) {
+                skipWs();
+                if (upper(word()) == "OR") { (void)word(); }   // UPDATE OR REPLACE t
+            } else {
+                skipWs();
+                std::string w = upper(word());
+                if (w == "OR") { (void)word(); skipWs(); w = upper(word()); }
+                if (w != "INTO" && w != "FROM") return "";     // 形状不认识，放弃
+            }
+            std::string t = ident();
+            skipWs();
+            if (i < limit && sql[i] == '.') { ++i; t = ident(); }   // 库名.表名 → 取表名
+            return t;
+        }
+
+        inline bool isMsgTable(const std::string& t) {
+            if (t.size() < 4) return false;
+            return (t[0] == 'M' || t[0] == 'm') && (t[1] == 'S' || t[1] == 's') &&
+                   (t[2] == 'G' || t[2] == 'g') && t[3] == '_';
+        }
+
+        // 目标库名：句柄登记表里有就用，没有写 unknown（绝不主动去查库）
+        inline std::string dbName(sqlite3* db) {
+            if (db == nullptr) return "null-db";
+            std::lock_guard<std::mutex> lg(g_mtx);
+            auto it = g_opened.find((LPVOID)db);
+            if (it != g_opened.end() && !it->second.empty()) return it->second;
+            if (g_unknownHandles.count((LPVOID)db)) return "unknown";
+            return "unknown";
+        }
+
+        inline size_t countParams(const char* sql, int n) {
+            if (sql == nullptr) return 0;
+            size_t limit = (n < 0) ? strlen(sql) : (size_t)n;
+            size_t c = 0;
+            for (size_t k = 0; k < limit; ++k) if (sql[k] == '?') ++c;
+            return c;
+        }
+
+        // 语句特征：首个关键字 + 第二个关键字 + 尽力解析出的目标表
+        struct Sig { std::string kw1, kw2, table; };
+
+        inline Sig makeSig(const char* sql, int n) {
+            Sig g;
+            if (sql == nullptr) return g;
+            int limit = (n < 0) ? (int)strlen(sql) : n;
+            if (limit > 512) limit = 512;      // 只看前 512 字节，代价有界
+            if (limit <= 0) return g;
+            int i = 0;
+            g.kw1 = upperOf(readIdent(sql, limit, i));
+            g.kw2 = upperOf(readIdent(sql, limit, i));
+            const std::string& k1 = g.kw1;
+            if (k1 == "INSERT" || k1 == "REPLACE" || k1 == "UPDATE" || k1 == "DELETE") {
+                Kw kw = (k1 == "INSERT")  ? Kw::Insert
+                      : (k1 == "UPDATE")  ? Kw::Update
+                      : (k1 == "DELETE")  ? Kw::Delete
+                                          : Kw::Replace;
+                g.table = targetTable(sql, limit, kw);   // 复用第一轮写好的解析
+            } else if (k1 == "SELECT" || k1 == "WITH" || k1 == "EXPLAIN") {
+                g.table = findAfterKeyword(sql, limit, "FROM");
+            } else if (k1 == "PRAGMA") {
+                g.table = g.kw2;                          // PRAGMA database_list / table_info
+            } else if (k1 == "CREATE" || k1 == "DROP" || k1 == "ALTER") {
+                g.table = findAfterKeyword(sql, limit, "TABLE");
+                if (g.table.empty()) g.table = findAfterKeyword(sql, limit, "INDEX");
+                if (g.table.empty()) g.table = findAfterKeyword(sql, limit, "VIEW");
+                if (upperOf(g.table) == "IF") g.table = findAfterKeyword(sql, limit, "EXISTS");
+            }
+            auto dot = g.table.find('.');
+            if (dot != std::string::npos) g.table = g.table.substr(dot + 1);   // 库名.表名 → 表名
+            return g;
+        }
+
+        // 所有 SQL 入口（prepare / prepare16_v2 / prepare_v3 / prepare16_v3 / exec）汇到这里。
+        // 只读、只记日志；不改 rc / 出参 / 控制流。
+        inline void onSql(sqlite3* db, const char* sql, int n, int rc, sqlite3_stmt** stmt,
+                          const char* via, void* caller) {
+            uint64_t off = 0;
+            const char* cls = callerClass(caller, off);
+            countCaller(cls);
+
+            // ① 一次性存活证明：区分"没命中"和"钩子没挂上"
+            static std::atomic<bool> firstCall{ true };
+            if (firstCall.exchange(false)) {
+                char b[256];
+                _snprintf_s(b, sizeof(b), _TRUNCATE,
+                            "[probe] %s 首个 SQL 入口被调用 via=%s from=%s+0x%llX sql=",
+                            stamp().c_str(), via, cls, (unsigned long long)off);
+                sink(std::string(b) + clip(sql, n, 160) + "\r\n");
+            }
+
+            Sig g = makeSig(sql, n);
+
+            // ② 广谱：前 40 条互不相同的语句特征（来源不同算不同条）
+            {
+                static std::mutex seenMtx;
+                static std::set<std::string> seen;
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lg(seenMtx);
+                    std::string key = std::string(cls) + "|" + g.kw1 + "|" + g.kw2 + "|" + g.table;
+                    if (seen.size() < 40 && seen.insert(key).second) fresh = true;
+                }
+                if (fresh) {
+                    char b[320];
+                    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                                "[PROBE-SIG] %s from=%s+0x%llX via=%s kw1=%s kw2=%s table=%s rc=%d db=%s sql=",
+                                stamp().c_str(), cls, (unsigned long long)off, via,
+                                g.kw1.c_str(), g.kw2.c_str(),
+                                (g.table.empty() ? "-" : g.table.c_str()), rc, dbName(db).c_str());
+                    sink(std::string(b) + clip(sql, n, 120) + "\r\n");
+                }
+            }
+
+            // ③ 任何写语句都记（封顶 300 行）—— "写发生在这个实例上吗"的直接证据
+            if (g.kw1 == "INSERT" || g.kw1 == "UPDATE" || g.kw1 == "DELETE" || g.kw1 == "REPLACE") {
+                static std::atomic<long long> wcount{ 0 };
+                long long wn = ++wcount;
+                if (wn <= 300) {
+                    char b[320];
+                    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                                "[PROBE-WRITE#%lld] %s from=%s+0x%llX via=%s db=%s table=%s rc=%d sql=",
+                                wn, stamp().c_str(), cls, (unsigned long long)off, via,
+                                dbName(db).c_str(), (g.table.empty() ? "-" : g.table.c_str()), rc);
+                    sink(std::string(b) + clip(sql, n, 400) + "\r\n");
+                }
+            }
+
+            // ④ 第一轮那一类：INSERT + Msg_*（保留语义，封顶 500）
+            if (g.kw1 == "INSERT" && isMsgTable(g.table)) {
+                static std::atomic<long long> mcount{ 0 };
+                long long mn = ++mcount;
+                if (mn <= 500) {
+                    char b[256];
+                    _snprintf_s(b, sizeof(b), _TRUNCATE,
+                                "[PROBE-MSG#%lld] %s from=%s+0x%llX via=%s db=%s table=%s rc=%d stmt=0x%p ph=%zu sql=",
+                                mn, stamp().c_str(), cls, (unsigned long long)off, via,
+                                dbName(db).c_str(), g.table.c_str(), rc,
+                                (void*)((stmt && *stmt) ? *stmt : nullptr), countParams(sql, n));
+                    sink(std::string(b) + clip(sql, n, 900) + "\r\n");
+                }
+            }
+        }
+
+        // UTF-16 入口（prepare16_v2 / prepare16_v3）：先转 UTF-8，再走同一套判定
+        inline void onSql16(sqlite3* db, const void* sql16, int n, int rc, sqlite3_stmt** stmt,
+                            const char* via, void* caller) {
+            if (sql16 == nullptr) { onSql(db, nullptr, -1, rc, stmt, via, caller); return; }
+            int wchars;
+            if (n < 0) {                                   // NUL 结尾：自己数，但封顶（不做无界扫描）
+                wchars = 0;
+                while (wchars < 4096 && ((const wchar_t*)sql16)[wchars] != 0) ++wchars;
+            } else {
+                wchars = n / 2;                            // n 是 UTF-16 的字节数
+            }
+            if (wchars > 512) wchars = 512;                // 只转前 512 个宽字符
+            if (wchars <= 0) { onSql(db, "", 0, rc, stmt, via, caller); return; }
+            char buf[2048] = { 0 };
+            int got = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)sql16, wchars,
+                                          buf, (int)sizeof(buf) - 1, nullptr, nullptr);
+            if (got < 0) got = 0;
+            buf[got] = '\0';
+            onSql(db, buf, got, rc, stmt, via, caller);
+        }
+
+        // prepare（sqlite3_prepare_v2）入口
+        inline void onPrepare(sqlite3* db, const char* sql, int n, int rc, sqlite3_stmt** stmt, void* caller) {
+            onSql(db, sql, n, rc, stmt, "prepare", caller);
+        }
+
+        // open_v2 探针：这个 sqlite 实例打开过哪些库（封顶 100 行）
+        inline void onOpen(const char* filename, int rc, void* db) {
+            if (filename == nullptr || *filename == '\0') return;
+            static std::atomic<long long> n{ 0 };
+            long long k = ++n;
+            if (k > 100) return;
+            std::string p(filename);
+            auto pos = p.find_last_of("\\/");
+            std::string base = (pos == std::string::npos) ? p : p.substr(pos + 1);
+            char b[256];
+            _snprintf_s(b, sizeof(b), _TRUNCATE, "[PROBE-OPEN#%lld] %s rc=%d handle=0x%p file=%s\r\n",
+                        k, stamp().c_str(), rc, db, base.c_str());
+            sink(b);
+        }
+
+        // 安装时喊一声：把来源识别范围算好（热路径上只读全局，无锁无 API 调用）
+        // ── step 探针（对付"语句被缓存"这个坑）──────────────────────────
+        // 为什么要它：WCDB 会把 prepare 好的语句**缓存起来反复用**
+        // （SQLITE_PREPARE_PERSISTENT）。如果那条 INSERT 是在我们挂钩之前就 prepare 好的，
+        // 那么无论我们挂多少个 prepare 入口都永远看不到它 —— 但它的 step 一定会被我们撞上。
+        // 所以这里用 api->sql(stmt) 反查"正在执行的语句"的 SQL 原文：
+        // 与 prepare 时机无关，是"写库到底在不在这台 sqlite 上"最直接的证据。
+        // 调用方来源（self/wx）同时给出 Weixin.dll 里的调用点 RVA —— 万一路线 B 要逆向，这就是入口。
+        inline void onStep(sqlite3_stmt* stmt, int rc, void* caller) {
+            if (g_api == nullptr || g_api->sql == nullptr || stmt == nullptr) return;
+            const char* sql = g_api->sql(stmt);
+            if (sql == nullptr || *sql == '\0') return;
+            uint64_t off = 0;
+            const char* cls = callerClass(caller, off);
+            Sig g = makeSig(sql, -1);
+            // 去重：同一 (来源,语句特征) 只记一次（封顶 60）
+            static std::mutex m;
+            static std::set<std::string> seen;
+            bool fresh = false;
+            {
+                std::lock_guard<std::mutex> lg(m);
+                std::string key = std::string(cls) + "|" + g.kw1 + "|" + g.kw2 + "|" + g.table;
+                if (seen.size() < 60 && seen.insert(key).second) fresh = true;
+            }
+            if (!fresh) return;
+            bool isWrite = (g.kw1 == "INSERT" || g.kw1 == "UPDATE" ||
+                            g.kw1 == "DELETE" || g.kw1 == "REPLACE");
+            const char* tag = (g.kw1 == "INSERT" && isMsgTable(g.table))
+                            ? "-MSG" : (isWrite ? "-W" : "");
+            sqlite3* db = (g_api->db_handle != nullptr) ? (sqlite3*)g_api->db_handle(stmt) : nullptr;
+            char b[352];
+            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                        "[PROBE-STEP%s] %s from=%s+0x%llX kw1=%s kw2=%s table=%s rc=%d stmt=0x%p db=%s sql=",
+                        tag, stamp().c_str(), cls, (unsigned long long)off,
+                        g.kw1.c_str(), g.kw2.c_str(), (g.table.empty() ? "-" : g.table.c_str()),
+                        rc, (void*)stmt, dbName(db).c_str());
+            sink(std::string(b) + clip(sql, -1, 300) + "\r\n");
+        }
+
+        inline void arm() {
+            if (g_hModule) {
+                g_selfBase = (uint64_t)g_hModule;
+                g_selfEnd = g_selfBase + peImageSize(g_selfBase);
+            }
+            if (g_hWeixinDll) {
+                g_wxBase = (uint64_t)g_hWeixinDll;
+                g_wxEnd = g_wxBase + peImageSize(g_wxBase);
+            }
+            char b[320];
+            _snprintf_s(b, sizeof(b), _TRUNCATE,
+                        "[probe] %s 来源识别就绪 self=[0x%llX,0x%llX) wx=[0x%llX,0x%llX)\r\n",
+                        stamp().c_str(),
+                        (unsigned long long)g_selfBase, (unsigned long long)g_selfEnd,
+                        (unsigned long long)g_wxBase, (unsigned long long)g_wxEnd);
+            sink(b);
+            sink("[probe] " + stamp() + " SQL 入口探针已就绪（只记日志）\r\n");
+        }
+    }
+
+    // ── 第二轮补挂的 SQL 入口（都在同一张 sqlite3_api_routines 表里）──────
+    //   prepare16    == sqlite3_prepare16_v2  (sqlite3.h:164)
+    //   prepare_v3   == sqlite3_prepare_v3    (sqlite3.h:336)
+    //   prepare16_v3 == sqlite3_prepare16_v3  (sqlite3.h:338)
+    //   exec         == sqlite3_exec          (sqlite3.h:146)
+    // 全部用 MinHook 挂"函数代码地址"（与 prepare / open_v2 同一套已验证生效的手法）。
+    typedef int (*prepare16_t)(sqlite3*, const void*, int, sqlite3_stmt**, const void**);
+    prepare16_t g_origPrepare16 = nullptr;
+
+    typedef int (*prepare_v3_t)(sqlite3*, const char*, int, unsigned int, sqlite3_stmt**, const char**);
+    prepare_v3_t g_origPrepareV3 = nullptr;
+
+    typedef int (*prepare16_v3_t)(sqlite3*, const void*, int, unsigned int, sqlite3_stmt**, const void**);
+    prepare16_v3_t g_origPrepare16V3 = nullptr;
+
+    typedef int (*exec_t)(sqlite3*, const char*, sqlite3_callback, void*, char**);
+    exec_t g_origExec = nullptr;
+
+    // step == sqlite3_step (sqlite3.h:186)。最热，但也是唯一能戳穿"语句被缓存"的入口。
+    typedef int (*step_t)(sqlite3_stmt*);
+    step_t g_origStep = nullptr;
+
+    int detourStep(sqlite3_stmt* stmt) {
+        void* caller = _ReturnAddress();
+        int rc = g_origStep ? g_origStep(stmt) : 1;
+        // 每个 stmt 对象只取样一次（环形缓存，无锁）；step 的热路径就是一次 load+比较
+        if (stmt != nullptr && !probe::stmtSeen((void*)stmt)) {
+            probe::onStep(stmt, rc, caller);
+        }
+        return rc;
+    }
+
     int detourPrepare(sqlite3* db, const char* sql, int n, sqlite3_stmt** stmt, const char** tail) {
+        void* caller = _ReturnAddress();     // 原调用者（MinHook 用 jmp 进 detour，返回地址不变）
         int rc = g_origPrepare ? g_origPrepare(db, sql, n, stmt, tail) : 1;
         // 只在成功且句柄未知时才登记（noteHandle 内部会先查表，开销可忽略）
         if (db != nullptr) {
             noteHandle(db, g_api);
         }
+        // 探针：只记日志。不改 rc、不改出参、不拦截。
+        probe::onPrepare(db, sql, n, rc, stmt, caller);
         return rc;
+    }
+
+    int detourPrepare16(sqlite3* db, const void* sql, int n, sqlite3_stmt** stmt, const void** tail) {
+        void* caller = _ReturnAddress();
+        int rc = g_origPrepare16 ? g_origPrepare16(db, sql, n, stmt, tail) : 1;
+        if (db != nullptr) noteHandle(db, g_api);
+        probe::onSql16(db, sql, n, rc, stmt, "prepare16_v2", caller);
+        return rc;
+    }
+
+    int detourPrepareV3(sqlite3* db, const char* sql, int n, unsigned int flags,
+                        sqlite3_stmt** stmt, const char** tail) {
+        void* caller = _ReturnAddress();
+        int rc = g_origPrepareV3 ? g_origPrepareV3(db, sql, n, flags, stmt, tail) : 1;
+        if (db != nullptr) noteHandle(db, g_api);
+        probe::onSql(db, sql, n, rc, stmt, "prepare_v3", caller);
+        return rc;
+    }
+
+    int detourPrepare16V3(sqlite3* db, const void* sql, int n, unsigned int flags,
+                          sqlite3_stmt** stmt, const void** tail) {
+        void* caller = _ReturnAddress();
+        int rc = g_origPrepare16V3 ? g_origPrepare16V3(db, sql, n, flags, stmt, tail) : 1;
+        if (db != nullptr) noteHandle(db, g_api);
+        probe::onSql16(db, sql, n, rc, stmt, "prepare16_v3", caller);
+        return rc;
+    }
+
+    int detourExec(sqlite3* db, const char* sql, sqlite3_callback cb, void* arg, char** errmsg) {
+        void* caller = _ReturnAddress();
+        int rc = g_origExec ? g_origExec(db, sql, cb, arg, errmsg) : 1;
+        if (db != nullptr) noteHandle(db, g_api);
+        probe::onSql(db, sql, -1, rc, nullptr, "exec", caller);
+        return rc;
+    }
+
+    // 挂一个"函数代码级"钩子。失败只记日志、返回 false —— 绝不抛、绝不影响既有行为。
+    bool installOneHook(void* target, LPVOID detour, LPVOID* orig, const char* name) {
+        if (target == nullptr) {
+            OutputDebugStringA((std::string("[db_registry] ") + name + " 槽位为空（该 sqlite 版本没这个入口），跳过\n").c_str());
+            return false;
+        }
+        if (MH_CreateHook(target, detour, orig) != MH_OK) {
+            OutputDebugStringA((std::string("[db_registry] MH_CreateHook(") + name + ") 失败\n").c_str());
+            return false;
+        }
+        if (MH_EnableHook(target) != MH_OK) {
+            OutputDebugStringA((std::string("[db_registry] MH_EnableHook(") + name + ") 失败\n").c_str());
+            return false;
+        }
+        OutputDebugStringA((std::string("[db_registry] ") + name + " 钩子已安装\n").c_str());
+        return true;
     }
 
     void installPrepare(sqlite3_api_routines* api) {
@@ -98,6 +659,18 @@ namespace db_registry {
             return;
         }
         OutputDebugStringA("[db_registry] prepare 钩子已安装（句柄按真实查询记录）\n");
+
+        // ── 第二轮：把其它 SQL 入口一次挂全 ──────────────────────────────
+        // 第一轮实测"消息写库不经过 prepare"，所以把这张表上所有可能承载 SQL 的入口都挂上，
+        // 一次部署就能看出写库到底走哪个（全部失败也不影响主路径，纯探针）。
+        installOneHook((void*)api->prepare16,    (LPVOID)&detourPrepare16,   (LPVOID*)&g_origPrepare16,   "prepare16_v2");
+        installOneHook((void*)api->prepare_v3,   (LPVOID)&detourPrepareV3,   (LPVOID*)&g_origPrepareV3,   "prepare_v3");
+        installOneHook((void*)api->prepare16_v3, (LPVOID)&detourPrepare16V3, (LPVOID*)&g_origPrepare16V3, "prepare16_v3");
+        installOneHook((void*)api->exec,         (LPVOID)&detourExec,        (LPVOID*)&g_origExec,        "exec");
+        // step：唯一能抓到"挂钩之前就 prepare 好、之后反复复用"的写语句
+        installOneHook((void*)api->step,         (LPVOID)&detourStep,        (LPVOID*)&g_origStep,        "step");
+
+        probe::arm();   // 探针就绪（只记日志，见文件上方 probe 命名空间）
     }
 
     // ── 方式二（真正生效的那个）：直接 hook open_v2 的函数代码 ──────────
