@@ -197,6 +197,7 @@
     <ClInclude Include="include\wx_send.h" />
     <ClInclude Include="include\wx_send_xml.h" />
     <ClInclude Include="xdb\db_mgr.h" />
+    <ClInclude Include="xdb\msg_push.h" />
     <ClInclude Include="xdb\sqlite3.h" />
     <ClInclude Include="xdb\SundaySearch.h" />
     <ClInclude Include="xdb\xwechat_offsets.h" />
@@ -231,6 +232,7 @@
     <ClCompile Include="src\wx_send.cpp" />
     <ClCompile Include="src\wx_send_xml.cpp" />
     <ClCompile Include="xdb\db_mgr.cpp" />
+    <ClCompile Include="xdb\msg_push.cpp" />
     <ClCompile Include="xdb\SundaySearch.cpp" />
   </ItemGroup>
   <ItemGroup>

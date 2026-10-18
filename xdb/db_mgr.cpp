@@ -3,6 +3,7 @@
 #include <chrono>
 #include <set>
 #include <string>
+#include <vector>
 #include <cstring>
 #include <cstdio>
 #include <intrin.h>   // _ReturnAddress()：识别 SQL 入口的调用来源
@@ -11,6 +12,7 @@
 #include "global.h"
 #include "tools.h"
 #include "MinHook.h"
+#include "msg_push.h"   // 第三轮：消息写入抓取 + 推送（见 msg_push.h 顶部说明）
 
 // ══════════════════════════════════════════════════════════════════
 //  数据库句柄登记表（修复"靠扫内存找句柄"的脆弱做法）
@@ -224,12 +226,14 @@ namespace db_registry {
             for (auto& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 32);
             return s;
         }
-        // 读 i 处的标识符（支持 "t" [t] `t`）；i 前进；读不到返回空且 i 不动
-        inline std::string readIdent(const char* sql, int limit, int& i) {
+        // 读 i 处的标识符（支持 "t" [t] `t`；allowSQuote=true 时也认 't'）；i 前进；读不到返回空且 i 不动
+        // allowSQuote 只给 INSERT 解析用：SQLite 允许把 'main' 当标识符写，
+        // 但 'xxx' 在普通表达式里是字符串字面量，全局放开会让 SELECT 的表名解析跑偏。
+        inline std::string readIdent(const char* sql, int limit, int& i, bool allowSQuote = false) {
             while (i < limit && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\r' || sql[i] == '\n')) ++i;
             if (i >= limit) return "";
             char c = sql[i];
-            if (c == '"' || c == '[' || c == '`') {
+            if (c == '"' || c == '[' || c == '`' || (allowSQuote && c == '\'')) {
                 char close = (c == '[') ? ']' : c;
                 ++i;
                 size_t st = (size_t)i;
@@ -261,9 +265,45 @@ namespace db_registry {
             return "";
         }
 
+        // 解析 INSERT/REPLACE 的形状：目标表 + 列清单。
+        // 这是修好 `INSERT INTO 'main'.'Msg_x' (a,b) VALUES(?,?)` 的关键
+        // （旧解析只认双引号，且不剥 '库名.' 前缀 → 日志里 table=-，Msg_ 写入被漏判）。
+        inline void parseInsert(const char* sql, int limit, std::string& table,
+                                std::vector<std::string>& cols) {
+            int i = 0;
+            (void)readIdent(sql, limit, i, true);                       // INSERT / REPLACE
+            std::string w = upperOf(readIdent(sql, limit, i, true));
+            if (w == "OR") {                                            // INSERT OR REPLACE / OR IGNORE
+                (void)readIdent(sql, limit, i, true);
+                w = upperOf(readIdent(sql, limit, i, true));
+            }
+            if (w != "INTO") return;                                    // 形状不认识，交给调用方兜底
+            table = readIdent(sql, limit, i, true);
+            // '库名'.'表名' → 取表名
+            while (i < limit && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\r' || sql[i] == '\n')) ++i;
+            if (i < limit && sql[i] == '.') {
+                ++i;
+                table = readIdent(sql, limit, i, true);
+            }
+            // 列清单 (a, b, c)：有就解析，没有（INSERT INTO t VALUES(...)）留空给调用方查 PRAGMA
+            while (i < limit && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\r' || sql[i] == '\n')) ++i;
+            if (i < limit && sql[i] == '(') {
+                ++i;
+                for (int guard = 0; guard < 256; ++guard) {
+                    std::string name = readIdent(sql, limit, i, true);
+                    if (!name.empty()) cols.push_back(name);
+                    while (i < limit && (sql[i] == ' ' || sql[i] == '\t')) ++i;
+                    if (i < limit && sql[i] == ',') { ++i; continue; }
+                    break;
+                }
+            }
+        }
+
+
         // 从写语句里取出目标表名（不做完整 SQL 解析，够用即可；取不到返回空串）。
         // 认 INSERT [OR ...] INTO t / REPLACE INTO t / UPDATE t / DELETE FROM t，
         // 支持 "库名.表名"（取表名）、"t"/[t]/`t` 三种引号。
+        // 注：INSERT/REPLACE 现在走上面的 parseInsert（它还会给列清单），这里主要给 UPDATE/DELETE 用。
         inline std::string targetTable(const char* sql, int n, Kw kw) {
             if (sql == nullptr) return "";
             int limit = (n < 0) ? 512 : (n < 512 ? n : 512);
@@ -285,7 +325,10 @@ namespace db_registry {
                 skipWs();
                 if (i >= limit) return "";
                 char c = sql[i];
-                if (c == '"' || c == '[' || c == '`') {
+                // 单引号也要认：SQLite 允许把 'main' 当标识符写，
+                // 实测微信全是 `INSERT/DELETE FROM 'main'.'xxx'` 这种形状（不认就 table=-）。
+                // 这里是在"已知位置"读标识符（不是搜索），所以不会被字符串字面量带偏。
+                if (c == '"' || c == '[' || c == '`' || c == '\'') {
                     char close = (c == '[') ? ']' : c;
                     ++i;
                     size_t s = (size_t)i;
@@ -302,12 +345,22 @@ namespace db_registry {
             };
             (void)word();
             if (kw == Kw::Update) {
+                // UPDATE [OR <conflict-algo>] <表名> SET ...
+                // 旧实现这里用 word() 读掉了表名却丢掉，结果表名变成后面的 SET（实测 UPDATE Msg_x → table=SET）。
+                // 改成：只在确实是 "OR" 时消费，否则回退，让下面的 ident() 去读表名（它认引号与库名前缀）。
+                // 注意 word() 不跳空白，连续读两个词之间必须显式 skipWs()。
+                int save = i;
                 skipWs();
-                if (upper(word()) == "OR") { (void)word(); }   // UPDATE OR REPLACE t
+                if (upper(word()) == "OR") {
+                    skipWs();
+                    (void)word();                       // 消费冲突算法
+                } else {
+                    i = save;                           // 不是 OR → 回退
+                }
             } else {
                 skipWs();
                 std::string w = upper(word());
-                if (w == "OR") { (void)word(); skipWs(); w = upper(word()); }
+                if (w == "OR") { skipWs(); (void)word(); skipWs(); w = upper(word()); }
                 if (w != "INTO" && w != "FROM") return "";     // 形状不认识，放弃
             }
             std::string t = ident();
@@ -340,8 +393,8 @@ namespace db_registry {
             return c;
         }
 
-        // 语句特征：首个关键字 + 第二个关键字 + 尽力解析出的目标表
-        struct Sig { std::string kw1, kw2, table; };
+        // 语句特征：首个关键字 + 第二个关键字 + 尽力解析出的目标表（+ INSERT 的列清单）
+        struct Sig { std::string kw1, kw2, table; std::vector<std::string> cols; };
 
         inline Sig makeSig(const char* sql, int n) {
             Sig g;
@@ -353,12 +406,16 @@ namespace db_registry {
             g.kw1 = upperOf(readIdent(sql, limit, i));
             g.kw2 = upperOf(readIdent(sql, limit, i));
             const std::string& k1 = g.kw1;
-            if (k1 == "INSERT" || k1 == "REPLACE" || k1 == "UPDATE" || k1 == "DELETE") {
-                Kw kw = (k1 == "INSERT")  ? Kw::Insert
-                      : (k1 == "UPDATE")  ? Kw::Update
-                      : (k1 == "DELETE")  ? Kw::Delete
-                                          : Kw::Replace;
-                g.table = targetTable(sql, limit, kw);   // 复用第一轮写好的解析
+            if (k1 == "INSERT" || k1 == "REPLACE") {
+                // 走 parseInsert：它同时给出目标表 + 列清单，并正确处理
+                // `INSERT INTO 'main'.'Msg_x' (a,b) VALUES(?,?)` 这种带引号/带库名前缀的形状
+                parseInsert(sql, limit, g.table, g.cols);
+                if (g.table.empty()) {                     // 形状不认识 → 退回老解析
+                    g.table = targetTable(sql, limit, (k1 == "INSERT") ? Kw::Insert : Kw::Replace);
+                }
+            } else if (k1 == "UPDATE" || k1 == "DELETE") {
+                Kw kw = (k1 == "UPDATE") ? Kw::Update : Kw::Delete;
+                g.table = targetTable(sql, limit, kw);
             } else if (k1 == "SELECT" || k1 == "WITH" || k1 == "EXPLAIN") {
                 g.table = findAfterKeyword(sql, limit, "FROM");
             } else if (k1 == "PRAGMA") {
@@ -372,6 +429,161 @@ namespace db_registry {
             auto dot = g.table.find('.');
             if (dot != std::string::npos) g.table = g.table.substr(dot + 1);   // 库名.表名 → 表名
             return g;
+        }
+
+        // ── 第三轮：把"消息写库"的语句标进 msgpush ──────────────────────
+        //  判定：INSERT/REPLACE + 表名像消息表 + 目标库属于 message 家族（拿不到库名就放宽）。
+        //  标记本身不做任何拦截：只是让 bind/step 知道"这条要抓"。
+        inline void logCappedProbe(std::atomic<long long>& c, int cap, const std::string& line) {
+            long long v = ++c;
+            if (v <= cap) sink(line);
+            else if (v == cap + 1) sink("[probe] 该类日志已达上限 " + std::to_string(cap) + " 条\r\n");
+        }
+
+        inline std::string lowerOf(std::string s) {
+            for (auto& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            return s;
+        }
+
+        // 库名属于 message 家族？拿不到（unknown/空）时放宽为 true —— 任务书要求"拿不到就按 SQL 判断"
+        inline bool isMessageDbName(const std::string& db) {
+            if (db.empty() || db == "unknown" || db == "null-db") return true;
+            return lowerOf(db).find("message") != std::string::npos;
+        }
+
+        // 表名像消息表？Msg_* 一定要；另外 message/msg 家族的表也算（例如 message_fts_v4_0_content）
+        inline bool isMsgWriteTable(const std::string& t) {
+            if (t.empty()) return false;
+            if (isMsgTable(t)) return true;
+            std::string l = lowerOf(t);
+            return l.find("msg") != std::string::npos || l.find("message") != std::string::npos;
+        }
+
+        inline std::string quoteIdentSql(const std::string& name) {
+            std::string o = "\"";
+            for (size_t i = 0; i < name.size(); ++i) {
+                if (name[i] == '"') o += "\"\"";
+                else o += name[i];
+            }
+            o += "\"";
+            return o;
+        }
+
+        // INSERT 没写列清单时（INSERT INTO t VALUES(?,?)）用 PRAGMA table_info 拿列序，按表缓存
+        inline std::vector<std::string> tableColumns(sqlite3* db, const std::string& table) {
+            static std::mutex m;
+            static std::map<std::string, std::vector<std::string>> cache;
+            {
+                std::lock_guard<std::mutex> lg(m);
+                auto it = cache.find(table);
+                if (it != cache.end()) return it->second;
+            }
+            std::vector<std::string> cols;
+            if (g_api != nullptr && g_api->prepare != nullptr && g_api->step != nullptr &&
+                g_api->finalize != nullptr && db != nullptr && !table.empty()) {
+                std::string sql = "PRAGMA table_info(" + quoteIdentSql(table) + ")";
+                sqlite3_stmt* st = nullptr;
+                if (g_api->prepare(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK && st != nullptr) {
+                    int guard = 0;
+                    while (g_api->step(st) == SQLITE_ROW && guard++ < 256) {
+                        // PRAGMA table_info 的列序：cid, name, type, notnull, dflt_value, pk
+                        const unsigned char* nm = (g_api->column_text != nullptr)
+                                                ? g_api->column_text(st, 1) : nullptr;
+                        cols.push_back(nm != nullptr ? std::string((const char*)nm) : std::string());
+                    }
+                    g_api->finalize(st);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lg(m);
+                cache[table] = cols;
+            }
+            return cols;
+        }
+
+        // 防重入：maybeMark → tableColumns → api->prepare → detourPrepare → maybeMark。
+        // （PRAGMA 本来就不命中标记条件，不会递归；这道锁只是保险。）
+        inline bool& inMark() { static thread_local bool v = false; return v; }
+        struct MarkGuard {
+            bool held;
+            MarkGuard() : held(false) { if (!inMark()) { inMark() = true; held = true; } }
+            ~MarkGuard() { if (held) inMark() = false; }
+        };
+
+        inline bool maybeMark(sqlite3* db, const char* sql, int n, int rc, sqlite3_stmt** stmt) {
+            if (rc != SQLITE_OK || stmt == nullptr || *stmt == nullptr || sql == nullptr) return false;
+            MarkGuard guard;
+            if (!guard.held) return false;
+
+            Sig g = makeSig(sql, n);
+            if (g.kw1 != "INSERT" && g.kw1 != "REPLACE") return false;
+            if (!isMsgWriteTable(g.table)) return false;
+
+            std::string dbn = dbName(db);
+            if (!isMessageDbName(dbn)) {
+                static std::atomic<long long> cSkip{ 0 };
+                logCappedProbe(cSkip, 20, "[PUSH-CHK-SKIP] " + stamp() + " db=" + dbn + " table=" + g.table
+                               + " 不是 message 家族库，跳过标记\r\n");
+                return false;
+            }
+
+            std::vector<std::string> cols = g.cols;             // 优先用 SQL 里的列清单
+            if (cols.empty()) cols = tableColumns(db, g.table); // 没有就查 PRAGMA（按表缓存）
+
+            bool pushable = isMsgTable(g.table);                // 只有 Msg_* 才是要推给桥的"消息行"
+
+            static std::atomic<long long> cChk{ 0 };
+            std::string colNames;
+            for (size_t k = 0; k < cols.size(); ++k) {
+                if (k) colNames += ",";
+                colNames += cols[k];
+            }
+            logCappedProbe(cChk, 40, "[PUSH-CHK] " + stamp() + " db=" + dbn + " table=" + g.table
+                           + " kw=" + g.kw1 + " cols=" + std::to_string(cols.size())
+                           + " cols=[" + colNames + "] push=" + (pushable ? "yes" : "no") + "\r\n");
+
+            msgpush::mark(*stmt, dbn, g.table, cols, pushable);
+            return true;
+        }
+
+        // 兜底：WCDB 会把 prepare 好的语句**缓存复用**。如果那条 INSERT 是在我们挂钩之前
+        // 就 prepare 好的，标记那一步永远轮不到它 —— 但它的 step 一定会撞上我们。
+        // 这里用 api->sql(stmt) 反查 SQL 补上标记：本条已经没有值了，**下一条起就能抓到**。
+        // 没有这道兜底，"挂钩前已缓存的写语句"会让第三轮一条都抓不到（第一轮就栽在这个坑）。
+        inline void lateMarkFromStmt(sqlite3_stmt* stmt) {
+            if (g_api == nullptr || g_api->sql == nullptr || stmt == nullptr) return;
+            const char* sql = g_api->sql(stmt);
+            if (sql == nullptr || *sql == '\0') return;
+            int k = 0;                                  // 廉价预筛：只有 INSERT/REPLACE 才值得解析
+            while (sql[k] == ' ' || sql[k] == '\t' || sql[k] == '\r' || sql[k] == '\n') ++k;
+            char c = sql[k];
+            if (c != 'I' && c != 'i' && c != 'R' && c != 'r') return;
+            sqlite3* db = (g_api->db_handle != nullptr) ? (sqlite3*)g_api->db_handle(stmt) : nullptr;
+            if (maybeMark(db, sql, -1, SQLITE_OK, &stmt)) {
+                static std::atomic<long long> cLate{ 0 };
+                logCappedProbe(cLate, 20, "[PUSH-LATE] " + stamp()
+                               + " 该语句在挂钩前就已 prepare，本次补上标记（本条无值，下一条起有值）\r\n");
+            }
+        }
+
+        // UTF-16 的标记路径（prepare16_v2 / prepare16_v3）：先有界转 UTF-8，再走同一套判定
+        inline void markFromSql16(sqlite3* db, const void* sql16, int n, int rc, sqlite3_stmt** stmt) {
+            if (rc != SQLITE_OK || sql16 == nullptr || stmt == nullptr || *stmt == nullptr) return;
+            int wchars;
+            if (n < 0) {                                   // NUL 结尾：自己数但封顶（不做无界扫描）
+                wchars = 0;
+                while (wchars < 4096 && ((const wchar_t*)sql16)[wchars] != 0) ++wchars;
+            } else {
+                wchars = n / 2;                            // n 是 UTF-16 的字节数
+            }
+            if (wchars > 512) wchars = 512;
+            if (wchars <= 0) return;
+            char buf[2048] = { 0 };
+            int got = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)sql16, wchars, buf,
+                                          (int)sizeof(buf) - 1, nullptr, nullptr);
+            if (got <= 0) return;
+            buf[got] = '\0';
+            maybeMark(db, buf, got, rc, stmt);
         }
 
         // 所有 SQL 入口（prepare / prepare16_v2 / prepare_v3 / prepare16_v3 / exec）汇到这里。
@@ -542,6 +754,8 @@ namespace db_registry {
                         (unsigned long long)g_wxBase, (unsigned long long)g_wxEnd);
             sink(b);
             sink("[probe] " + stamp() + " SQL 入口探针已就绪（只记日志）\r\n");
+            // 第三轮：把消息抓取+推送模块装上（它自己起一条工作线程；微信线程不碰网络）
+            msgpush::arm(&sink);
         }
     }
 
@@ -570,10 +784,117 @@ namespace db_registry {
     int detourStep(sqlite3_stmt* stmt) {
         void* caller = _ReturnAddress();
         int rc = g_origStep ? g_origStep(stmt) : 1;
+        // 第三轮：写语句成行（SQLITE_DONE）→ 打包 + 入队（纯内存操作，不联网）
+        if (rc == SQLITE_DONE && stmt != nullptr) {
+            // rowDone 返回 false = 这个 stmt 没被标记过 → 可能是在我们挂钩前就 prepare 好的缓存语句，
+            // 用 api->sql(stmt) 补标记（本条无值，下一条起有值）
+            if (!msgpush::rowDone(stmt)) {
+                probe::lateMarkFromStmt(stmt);
+            }
+        }
         // 每个 stmt 对象只取样一次（环形缓存，无锁）；step 的热路径就是一次 load+比较
         if (stmt != nullptr && !probe::stmtSeen((void*)stmt)) {
             probe::onStep(stmt, rc, caller);
         }
+        return rc;
+    }
+
+    // ── 第三轮：bind 家族 + finalize（都在同一张 g_api 表里）────────────
+    //   bind_blob/text 的二进制在 bind 那一刻就转 hex 拷走（调用方可能用 SQLITE_STATIC，
+    //   之后再改/释放那块内存），所以出参、rc、控制流一律原样。
+    typedef int (*bind_blob_t)(sqlite3_stmt*, int, const void*, int, void(*)(void*));
+    bind_blob_t g_origBindBlob = nullptr;
+    typedef int (*bind_blob64_t)(sqlite3_stmt*, int, const void*, sqlite3_uint64, void(*)(void*));
+    bind_blob64_t g_origBindBlob64 = nullptr;
+    typedef int (*bind_text_t)(sqlite3_stmt*, int, const char*, int, void(*)(void*));
+    bind_text_t g_origBindText = nullptr;
+    typedef int (*bind_text64_t)(sqlite3_stmt*, int, const char*, sqlite3_uint64, void(*)(void*), unsigned char);
+    bind_text64_t g_origBindText64 = nullptr;
+    typedef int (*bind_int_t)(sqlite3_stmt*, int, int);
+    bind_int_t g_origBindInt = nullptr;
+    typedef int (*bind_int64_t)(sqlite3_stmt*, int, sqlite_int64);
+    bind_int64_t g_origBindInt64 = nullptr;
+    typedef int (*bind_double_t)(sqlite3_stmt*, int, double);
+    bind_double_t g_origBindDouble = nullptr;
+    typedef int (*bind_null_t)(sqlite3_stmt*, int);
+    bind_null_t g_origBindNull = nullptr;
+    typedef int (*bind_value_t)(sqlite3_stmt*, int, const sqlite3_value*);
+    bind_value_t g_origBindValue = nullptr;
+    typedef int (*finalize_t)(sqlite3_stmt*);
+    finalize_t g_origFinalize = nullptr;
+
+    int detourBindBlob(sqlite3_stmt* s, int i, const void* p, int n, void(*d)(void*)) {
+        int rc = g_origBindBlob ? g_origBindBlob(s, i, p, n, d) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_BLOB, p, n, 0, 0.0);
+        return rc;
+    }
+    int detourBindBlob64(sqlite3_stmt* s, int i, const void* p, sqlite3_uint64 n, void(*d)(void*)) {
+        int rc = g_origBindBlob64 ? g_origBindBlob64(s, i, p, n, d) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_BLOB, p,
+                                                (n > 0x7FFFFFFFull) ? 0x7FFFFFFF : (int)n, 0, 0.0);
+        return rc;
+    }
+    int detourBindText(sqlite3_stmt* s, int i, const char* p, int n, void(*d)(void*)) {
+        int rc = g_origBindText ? g_origBindText(s, i, p, n, d) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_TEXT, p, n, 0, 0.0);
+        return rc;
+    }
+    int detourBindText64(sqlite3_stmt* s, int i, const char* p, sqlite3_uint64 n,
+                         void(*d)(void*), unsigned char enc) {
+        int rc = g_origBindText64 ? g_origBindText64(s, i, p, n, d, enc) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_TEXT, p,
+                                                (n > 0x7FFFFFFFull) ? 0x7FFFFFFF : (int)n, 0, 0.0);
+        return rc;
+    }
+    int detourBindInt(sqlite3_stmt* s, int i, int v) {
+        int rc = g_origBindInt ? g_origBindInt(s, i, v) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_INTEGER, nullptr, 0, (long long)v, 0.0);
+        return rc;
+    }
+    int detourBindInt64(sqlite3_stmt* s, int i, sqlite_int64 v) {
+        int rc = g_origBindInt64 ? g_origBindInt64(s, i, v) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_INTEGER, nullptr, 0, (long long)v, 0.0);
+        return rc;
+    }
+    int detourBindDouble(sqlite3_stmt* s, int i, double v) {
+        int rc = g_origBindDouble ? g_origBindDouble(s, i, v) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_FLOAT, nullptr, 0, 0, v);
+        return rc;
+    }
+    int detourBindNull(sqlite3_stmt* s, int i) {
+        int rc = g_origBindNull ? g_origBindNull(s, i) : 1;
+        if (rc == SQLITE_OK) msgpush::bindValue(s, i, SQLITE_NULL, nullptr, 0, 0, 0.0);
+        return rc;
+    }
+    // bind_value：WCDB 一般不用，但挂上更保险（用同一张表的 value_* 取值）
+    int detourBindValue(sqlite3_stmt* s, int i, const sqlite3_value* v) {
+        int rc = g_origBindValue ? g_origBindValue(s, i, v) : 1;
+        if (rc == SQLITE_OK && v != nullptr && g_api != nullptr && g_api->value_type != nullptr) {
+            sqlite3_value* vv = (sqlite3_value*)v;
+            int t = g_api->value_type(vv);
+            if (t == SQLITE_INTEGER) {
+                long long iv = (g_api->value_int64 != nullptr) ? (long long)g_api->value_int64(vv) : 0;
+                msgpush::bindValue(s, i, SQLITE_INTEGER, nullptr, 0, iv, 0.0);
+            } else if (t == SQLITE_FLOAT) {
+                double dv = (g_api->value_double != nullptr) ? g_api->value_double(vv) : 0.0;
+                msgpush::bindValue(s, i, SQLITE_FLOAT, nullptr, 0, 0, dv);
+            } else if (t == SQLITE_TEXT) {
+                const void* p = (g_api->value_text != nullptr) ? (const void*)g_api->value_text(vv) : nullptr;
+                int nb = (g_api->value_bytes != nullptr) ? g_api->value_bytes(vv) : -1;
+                msgpush::bindValue(s, i, SQLITE_TEXT, p, nb, 0, 0.0);
+            } else if (t == SQLITE_BLOB) {
+                const void* p = (g_api->value_blob != nullptr) ? g_api->value_blob(vv) : nullptr;
+                int nb = (g_api->value_bytes != nullptr) ? g_api->value_bytes(vv) : 0;
+                msgpush::bindValue(s, i, SQLITE_BLOB, p, nb, 0, 0.0);
+            } else if (t == SQLITE_NULL) {
+                msgpush::bindValue(s, i, SQLITE_NULL, nullptr, 0, 0, 0.0);
+            }
+        }
+        return rc;
+    }
+    int detourFinalize(sqlite3_stmt* s) {
+        int rc = g_origFinalize ? g_origFinalize(s) : 1;
+        msgpush::finalizeStmt(s);
         return rc;
     }
 
@@ -586,6 +907,7 @@ namespace db_registry {
         }
         // 探针：只记日志。不改 rc、不改出参、不拦截。
         probe::onPrepare(db, sql, n, rc, stmt, caller);
+        probe::maybeMark(db, sql, n, rc, stmt);     // 第三轮：标记消息写语句
         return rc;
     }
 
@@ -594,6 +916,7 @@ namespace db_registry {
         int rc = g_origPrepare16 ? g_origPrepare16(db, sql, n, stmt, tail) : 1;
         if (db != nullptr) noteHandle(db, g_api);
         probe::onSql16(db, sql, n, rc, stmt, "prepare16_v2", caller);
+        probe::markFromSql16(db, sql, n, rc, stmt);
         return rc;
     }
 
@@ -603,6 +926,7 @@ namespace db_registry {
         int rc = g_origPrepareV3 ? g_origPrepareV3(db, sql, n, flags, stmt, tail) : 1;
         if (db != nullptr) noteHandle(db, g_api);
         probe::onSql(db, sql, n, rc, stmt, "prepare_v3", caller);
+        probe::maybeMark(db, sql, n, rc, stmt);     // 实测消息写库走这个入口
         return rc;
     }
 
@@ -612,6 +936,7 @@ namespace db_registry {
         int rc = g_origPrepare16V3 ? g_origPrepare16V3(db, sql, n, flags, stmt, tail) : 1;
         if (db != nullptr) noteHandle(db, g_api);
         probe::onSql16(db, sql, n, rc, stmt, "prepare16_v3", caller);
+        probe::markFromSql16(db, sql, n, rc, stmt);
         return rc;
     }
 
@@ -669,6 +994,19 @@ namespace db_registry {
         installOneHook((void*)api->exec,         (LPVOID)&detourExec,        (LPVOID*)&g_origExec,        "exec");
         // step：唯一能抓到"挂钩之前就 prepare 好、之后反复复用"的写语句
         installOneHook((void*)api->step,         (LPVOID)&detourStep,        (LPVOID*)&g_origStep,        "step");
+
+        // ── 第三轮：bind 家族 + finalize（抓值 / 成行 / 清标记）────────────
+        // 只对"已标记的消息写语句"干活；未标记时 bind 路径只花一次原子读。
+        installOneHook((void*)api->bind_blob,     (LPVOID)&detourBindBlob,     (LPVOID*)&g_origBindBlob,     "bind_blob");
+        installOneHook((void*)api->bind_blob64,   (LPVOID)&detourBindBlob64,   (LPVOID*)&g_origBindBlob64,   "bind_blob64");
+        installOneHook((void*)api->bind_text,     (LPVOID)&detourBindText,     (LPVOID*)&g_origBindText,     "bind_text");
+        installOneHook((void*)api->bind_text64,   (LPVOID)&detourBindText64,   (LPVOID*)&g_origBindText64,   "bind_text64");
+        installOneHook((void*)api->bind_int,      (LPVOID)&detourBindInt,      (LPVOID*)&g_origBindInt,      "bind_int");
+        installOneHook((void*)api->bind_int64,    (LPVOID)&detourBindInt64,    (LPVOID*)&g_origBindInt64,    "bind_int64");
+        installOneHook((void*)api->bind_double,   (LPVOID)&detourBindDouble,   (LPVOID*)&g_origBindDouble,   "bind_double");
+        installOneHook((void*)api->bind_null,     (LPVOID)&detourBindNull,     (LPVOID*)&g_origBindNull,     "bind_null");
+        installOneHook((void*)api->bind_value,    (LPVOID)&detourBindValue,    (LPVOID*)&g_origBindValue,    "bind_value");
+        installOneHook((void*)api->finalize,      (LPVOID)&detourFinalize,     (LPVOID*)&g_origFinalize,     "finalize");
 
         probe::arm();   // 探针就绪（只记日志，见文件上方 probe 命名空间）
     }
