@@ -26,15 +26,87 @@
 //        记录为空时仍回退到原来的扫描（保证老库也能发现）。
 // ══════════════════════════════════════════════════════════════════
 namespace db_registry {
-    std::mutex g_mtx;
-    std::map<LPVOID, std::string> g_opened;      // 句柄 → 文件名
-    typedef int (*open_v2_t)(const char*, sqlite3**, int, const char*);
-    open_v2_t g_origOpenV2 = nullptr;
-    bool g_installed = false;
-    // 置 true 时 searchDatabases 会跳过登记表、强制做一次真实扫描。
-    // 用途：getDatabaseHandle 发现某个库不在缓存里时（微信的库是懒加载的）
-    //       需要真的重扫一次，不能又被登记表挡住。
-    bool g_forceRescan = false;
+    // ══════════════════════════════════════════════════════════════════
+    //  数据库句柄登记表（2026-10-19 第二次重做 · 干净版）
+    //
+    //  三条红线（改代码前先读 —— 上一版就是踩着它们把客户端搞崩的）：
+    //   ① **绝不主动探测句柄**：不发 SELECT 1、不 prepare 试探、不用 SEH 吞访问违例。
+    //      句柄"好坏"只由【真实查询的返回码】判定（noteQueryResult）。
+    //   ② prepare detour 里除"记一条映射"外什么都不做：不调 API、不读内存、
+    //      不做 I/O、不打日志。开销 = 一次哈希 + 一次线性探测 + 一次 relaxed store，
+    //      O(1) 且**完全无锁**（连互斥量都不碰，见 noteHot）。
+    //   ③ 缓存逐条维护：坏的那一条**只剔它自己**，绝不 m_dbs.clear()。
+    //
+    //  为什么原来会崩：在两个 detour 之外、从我们自己的线程往微信的**活连接**上
+    //  压 prepare("SELECT 1") 做"可用性探测"，靠 SEH 吞访问违例 —— 三次崩溃的主角。
+    //  为什么原来启动要 3 分钟：缓存为空时**每次调用**都做一遍全地址空间扫描，
+    //  桥每 2.5 秒轮询 6 张表 → 客户端被自己的扫描拖死（实测 scans=153）。
+    // ══════════════════════════════════════════════════════════════════
+
+    inline long long nowMs() { return (long long)GetTickCount64(); }
+
+    // sqlite3 API 表（installPrepare 里填入）。这里提前声明：取名/复核会用到它的只读槽位
+    // db_filename（**只读、不发 SQL**）。
+    sqlite3_api_routines* g_api = nullptr;
+
+    // ── 计数器（热路径上只有一次 relaxed 自增/store）──────────────────
+    std::atomic<long long> g_registrations{ 0 };    // 累计登记（含覆盖登记）
+    std::atomic<long long> g_pruned{ 0 };           // 逐条剔除的句柄数
+    std::atomic<long long> g_queryOk{ 0 };          // 真实查询：句柄健康
+    std::atomic<long long> g_queryFail{ 0 };        // 真实查询：连接级失败
+    std::atomic<long long> g_suspect{ 0 };          // 连续失败到达阈值（进入观察）
+    std::atomic<long long> g_evicted{ 0 };          // 到达阈值**且**内存读不通 → 剔除
+    std::atomic<long long> g_healCount{ 0 };        // 连续拿不到句柄触发的自愈次数
+    std::atomic<long long> g_hitRegistry{ 0 };      // 按名直查注册表命中
+    std::atomic<long long> g_hitCache{ 0 };         // m_dbs 缓存命中
+    std::atomic<long long> g_miss{ 0 };             // 没找到
+    std::atomic<long long> g_namePassRuns{ 0 };     // 取名扫描执行次数
+    std::atomic<long long> g_namePassSkipped{ 0 };  // 扫描进行中 → 直接返回缓存
+    std::atomic<long long> g_namePassThrottled{ 0 };// 节流窗口内 → 不扫
+    std::atomic<long long> g_lastScanMs{ 0 };       // 上次取名扫描时刻(ms)
+    std::atomic<int>       g_scanBusy{ 0 };         // 单飞标记（1 = 有线程正在扫）
+    std::atomic<int>       g_emptyScans{ 0 };       // 连续"扫了没收获"次数（指数退避用）
+    std::atomic<int>       g_passAttempted{ 0 };    // 上一轮取名扫描尝试了几个句柄
+    std::atomic<int>       g_passNamed{ 0 };        // 上一轮取名扫描成功了几个
+    std::atomic<long long> g_openNamed{ 0 };        // open_v2 直接给出的库名条数（诊断用）
+    std::atomic<long long> g_lastRegMs{ 0 };        // 最近一次**新句柄**出现的时刻（突发稳定判定用）
+    std::atomic<long long> g_lastFastRefreshMs{ 0 };// 上次轻量名字刷新时刻
+    std::atomic<long long> g_nameRefreshChanged{ 0 };// 轻量刷新纠正过多少次映射
+
+    // ── 句柄表：固定槽位 + 全原子字段（读路径零锁）──────────────────────
+    //  key: 0 = 空位，1 = 墓碑（已剔除，探测时跨过），其它 = 句柄地址。
+    //  为什么不用 std::map + mutex：prepare 是**每次查询**都走的热路径，
+    //  而桥每 2.5 秒要碰同一批数据，一把全局锁就把微信自己的 SQL 也拖慢了。
+    enum { kSlotCount = 1024 };
+    struct Slot {
+        std::atomic<uintptr_t> key{ 0 };
+        std::atomic<int>       name{ 0 };      // 名字池下标 + 1（0 = 还没名字）
+        std::atomic<long long> tick{ 0 };      // 最近一次在 SQL 入口见到(ms)
+        std::atomic<long long> lastOk{ 0 };    // 最近一次真实查询成功(ms)
+        std::atomic<long long> lastFail{ 0 };  // 最近一次连接级失败(ms)
+        std::atomic<int>       fail{ 0 };      // 连续失败计数（成功一次清零）
+        std::atomic<int>       src{ 0 };       // 0=prepare 1=open_v2 2=取名扫描
+    };
+    Slot g_slot[kSlotCount];
+
+    // 名字池：只追加、索引稳定（槽位里的 name 是下标 + 1）
+    std::mutex g_nameMtx;
+    std::vector<std::string> g_names;
+
+    inline int internName(const std::string& n) {
+        if (n.empty()) return 0;
+        std::lock_guard<std::mutex> lg(g_nameMtx);
+        for (size_t i = 0; i < g_names.size(); ++i) if (g_names[i] == n) return (int)i + 1;
+        if (g_names.size() >= 512) return 0;
+        g_names.push_back(n);
+        return (int)g_names.size();
+    }
+
+    // 一次性拷出名字池（给遍历用，避免每个槽位都去拿锁）
+    inline std::vector<std::string> copyNames() {
+        std::lock_guard<std::mutex> lg(g_nameMtx);
+        return g_names;
+    }
 
     // 从完整路径取文件名（如 ...\message_0.db → message_0.db）
     inline std::string baseName(const std::string& p) {
@@ -42,47 +114,542 @@ namespace db_registry {
         return pos == std::string::npos ? p : p.substr(pos + 1);
     }
 
-    // 探针前置声明（实现在下面的 probe 命名空间里，这里只是让 open_v2 detour 能用）
-    namespace probe { inline void onOpen(const char* filename, int rc, void* db); }
+    // 名字像不像库文件名（挡掉"句柄地址被复用时传进来的垃圾串"）
+    inline bool looksLikeDbName(const std::string& s) {
+        if (s.size() < 4 || s.size() > 128) return false;
+        if (s.find('\\') != std::string::npos || s.find('/') != std::string::npos) return false;
+        char a = s[s.size() - 3], b = s[s.size() - 2], c = s[s.size() - 1];
+        return (a == '.') && (b == 'd' || b == 'D') && (c == 'b' || c == 'B');
+    }
 
-    // 我们的 open_v2：先调原函数，成功就把句柄记下来
+    inline unsigned homeOf(uintptr_t p) {
+        uint64_t h = (uint64_t)p * 0x9E3779B97F4A7C15ull;
+        return (unsigned)((h >> 54) & (unsigned)(kSlotCount - 1));
+    }
+
+    // 查槽位（无锁读路径）：命中 → 槽位；没有 → nullptr
+    inline Slot* findSlot(uintptr_t p) {
+        unsigned i = homeOf(p);
+        for (unsigned n = 0; n < (unsigned)kSlotCount; ++n) {
+            Slot& s = g_slot[(i + n) & (unsigned)(kSlotCount - 1)];
+            const uintptr_t k = s.key.load(std::memory_order_relaxed);
+            if (k == p) return &s;
+            if (k == 0) return nullptr;           // 空位 = 这条探测链到头了
+        }
+        return nullptr;
+    }
+
+    // 占位：唯一用 CAS 的地方，只在**首次**见到某个句柄时发生（此后永不）
+    inline Slot* claimSlot(uintptr_t p) {
+        unsigned i = homeOf(p);
+        for (unsigned n = 0; n < (unsigned)kSlotCount; ++n) {
+            Slot& s = g_slot[(i + n) & (unsigned)(kSlotCount - 1)];
+            uintptr_t k = s.key.load(std::memory_order_relaxed);
+            if (k == p) return &s;
+            if (k == 0 || k == 1) {
+                if (s.key.compare_exchange_strong(k, p, std::memory_order_acq_rel)) {
+                    return &s;                    // 抢到（墓碑在 retire 时已清零全部字段）
+                }
+                if (k == p) return &s;            // 别人刚抢了同一个句柄
+            }
+        }
+        return nullptr;                           // 表满（1024 对实测 ~20 个库绰绰有余）
+    }
+
+    // 前向声明：safeDbName 定义在本命名空间后面（用 api->db_filename 只读取名）
+    inline bool safeDbName(void* handle, std::string& out);
+
+    // ★★ prepare detour 的**唯一**动作：记一条映射 ★★
+    //   O(1)、无锁、不调 API、不读内存、不做 I/O、不打日志。
+    //   首次见到的句柄也只是 CAS 占一个槽（无分配、无锁、无系统调用）。
+    inline void noteHot(void* db) {
+        const uintptr_t p = (uintptr_t)db;
+        if (p == 0) return;
+        Slot* s = findSlot(p);
+        if (s != nullptr) {
+            s->tick.store(nowMs(), std::memory_order_relaxed);
+            return;
+        }
+        Slot* c = claimSlot(p);
+        if (c != nullptr) {
+            c->tick.store(nowMs(), std::memory_order_relaxed);
+            g_registrations.fetch_add(1, std::memory_order_relaxed);
+            g_lastRegMs.store(nowMs(), std::memory_order_relaxed);   // 新句柄出现（只在首次登记时写）
+        }
+    }
+
+    // open_v2 登记（低频：每次开库一次；名字直接来自 filename 参数，安全且权威）
+    inline void noteOpened(void* db, const std::string& rawName) {
+        const uintptr_t p = (uintptr_t)db;
+        if (p == 0) return;
+        std::string nm = baseName(rawName);
+        if (!looksLikeDbName(nm)) nm.clear();
+        const int idx = internName(nm);            // 低频路径，允许拿名字锁
+        Slot* s = findSlot(p);
+        if (s == nullptr) s = claimSlot(p);
+        if (s == nullptr) return;
+        if (idx > 0) s->name.store(idx, std::memory_order_relaxed);   // 地址被复用 → 以最新一次 open 为准
+        if (idx > 0) g_openNamed.fetch_add(1, std::memory_order_relaxed);
+        s->src.store(1, std::memory_order_relaxed);
+        s->fail.store(0, std::memory_order_relaxed);                  // 新连接：失败计数清零
+        s->tick.store(nowMs(), std::memory_order_relaxed);
+        g_registrations.fetch_add(1, std::memory_order_relaxed);
+        g_lastRegMs.store(nowMs(), std::memory_order_relaxed);
+    }
+
+    // 取名扫描的成果回填（src=2）。只给**已登记**的句柄补名字，绝不新造句柄。
+    inline void noteNamed(void* db, const std::string& name) {
+        const uintptr_t p = (uintptr_t)db;
+        if (p == 0 || name.empty()) return;
+        const int idx = internName(name);
+        if (idx <= 0) return;
+        Slot* s = findSlot(p);
+        if (s == nullptr) return;
+        s->name.store(idx, std::memory_order_relaxed);
+        s->src.store(2, std::memory_order_relaxed);
+    }
+
+    inline bool isRegistered(uintptr_t p) { return findSlot(p) != nullptr; }
+
+    // 逐条剔除（**只删它自己**）
+    inline void retireHandle(uintptr_t p) {
+        Slot* s = findSlot(p);
+        if (s == nullptr) return;
+        s->key.store(1, std::memory_order_release);   // 先立墓碑：读路径立刻看不到它
+        s->name.store(0, std::memory_order_relaxed);
+        s->tick.store(0, std::memory_order_relaxed);
+        s->lastOk.store(0, std::memory_order_relaxed);
+        s->lastFail.store(0, std::memory_order_relaxed);
+        s->fail.store(0, std::memory_order_relaxed);
+        g_pruned.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // 连接级失败 = "这个句柄本身坏了"的返回码。
+    // SQLITE_ERROR(1)（SQL 写错 / 没有这个表）、BUSY/LOCKED（微信正在写）**不算** ——
+    // 它们恰好证明连接是活的、而且能正确回答。
+    inline bool isConnFailure(int rc) {
+        const int base = rc & 0xFF;
+        return base == SQLITE_MISUSE || base == SQLITE_NOTADB || base == SQLITE_CORRUPT ||
+               base == SQLITE_IOERR || base == SQLITE_CANTOPEN;
+    }
+
+    static const int kEvictStreak = 3;      // 连续 3 次连接级失败（且内存读不通）→ 剔除
+
+    // ★ 句柄好坏的**唯一**判据：真实查询的返回码（我们不主动去试）
+    //   返回 true = 这个句柄已被剔除，调用方应立刻丢掉它
+    bool noteQueryResult(void* db, int rc) {
+        const uintptr_t p = (uintptr_t)db;
+        if (p == 0) return false;
+        Slot* s = findSlot(p);
+        if (s == nullptr) return true;                        // 已被剔除 / 从未登记
+        if (!isConnFailure(rc)) {
+            s->fail.store(0, std::memory_order_relaxed);      // 成功一次就清零
+            s->lastOk.store(nowMs(), std::memory_order_relaxed);
+            g_queryOk.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        const int n = s->fail.fetch_add(1, std::memory_order_relaxed) + 1;
+        s->lastFail.store(nowMs(), std::memory_order_relaxed);
+        g_queryFail.fetch_add(1, std::memory_order_relaxed);
+
+        // ── SQLITE_MISUSE(21)：sqlite 自己说"这个连接对象不可用"（已关闭/不是连接）──
+        // 这不是瞬时状态（BUSY/LOCKED/IOERR 才是），所以**立刻**剔除，不等 3 次。
+        // 实测场景：WCDB 关掉 message_0.db 的连接后地址被复用，表里留着 3 个已关闭句柄，
+        // 桥每次查都拿到它 → `execute sqlite3_prepare failed` → 机器人静默失聪。
+        if ((rc & 0xFF) == SQLITE_MISUSE) {
+            retireHandle(p);
+            g_evicted.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (n < kEvictStreak) return false;
+        g_suspect.fetch_add(1, std::memory_order_relaxed);
+        // 最后一道闸门：IsReadableRegion 单独用会误杀**正常**句柄
+        // （sqlite3 对象只有几百字节，堆块后面未必还有 4KB 可读页），
+        // 所以只有"真实查询连续失败 + 内存也读不通"才剔除。
+        if (IsReadableRegion((const void*)p, 0x1000)) return false;
+        retireHandle(p);
+        g_evicted.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    struct Entry {
+        void*       handle;
+        std::string name;
+        int         fail;
+        long long   tick;
+        long long   lastOk;
+        long long   lastFail;
+        int         src;
+    };
+
+    // 遍历全表拷一份（1024 次 relaxed 读；桥每 2.5 秒调几次也没压力）
+    std::vector<Entry> snapshot() {
+        std::vector<std::string> names = copyNames();
+        std::vector<Entry> out;
+        out.reserve(64);
+        for (int i = 0; i < (int)kSlotCount; ++i) {
+            Slot& s = g_slot[i];
+            const uintptr_t p = s.key.load(std::memory_order_relaxed);
+            if (p == 0 || p == 1) continue;
+            Entry e;
+            e.handle = (void*)p;
+            const int idx = s.name.load(std::memory_order_relaxed);
+            if (idx > 0 && (size_t)idx <= names.size()) e.name = names[(size_t)idx - 1];
+            e.fail = s.fail.load(std::memory_order_relaxed);
+            e.tick = s.tick.load(std::memory_order_relaxed);
+            e.lastOk = s.lastOk.load(std::memory_order_relaxed);
+            e.lastFail = s.lastFail.load(std::memory_order_relaxed);
+            e.src = s.src.load(std::memory_order_relaxed);
+            out.push_back(e);
+        }
+        return out;
+    }
+
+    inline bool entryByHandle(void* h, Entry& out) {
+        Slot* s = findSlot((uintptr_t)h);
+        if (s == nullptr) return false;
+        out.handle = h;
+        const int idx = s->name.load(std::memory_order_relaxed);
+        out.name.clear();
+        if (idx > 0) {
+            std::lock_guard<std::mutex> lg(g_nameMtx);
+            if ((size_t)idx <= g_names.size()) out.name = g_names[(size_t)idx - 1];
+        }
+        out.fail = s->fail.load(std::memory_order_relaxed);
+        out.tick = s->tick.load(std::memory_order_relaxed);
+        out.lastOk = s->lastOk.load(std::memory_order_relaxed);
+        out.lastFail = s->lastFail.load(std::memory_order_relaxed);
+        out.src = s->src.load(std::memory_order_relaxed);
+        return true;
+    }
+
+    inline size_t liveCount() {
+        size_t n = 0;
+        for (int i = 0; i < (int)kSlotCount; ++i) {
+            const uintptr_t p = g_slot[i].key.load(std::memory_order_relaxed);
+            if (p != 0 && p != 1) ++n;
+        }
+        return n;
+    }
+
+    inline size_t unnamedCount() {
+        size_t n = 0;
+        for (int i = 0; i < (int)kSlotCount; ++i) {
+            Slot& s = g_slot[i];
+            const uintptr_t p = s.key.load(std::memory_order_relaxed);
+            if (p == 0 || p == 1) continue;
+            if (s.name.load(std::memory_order_relaxed) == 0) ++n;
+        }
+        return n;
+    }
+
+    // 需要取名扫描吗？（有句柄但没名字 → 需要）
+    // ★ 还要等"突发稳定" 2 秒：微信启动时会在十几秒内连续开 30+ 个库，
+    //   如果第一个句柄一出现就扫，只能拿到 1 个名字，剩下的得等 30 秒（实测启动因此多花 30s）。
+    //   等 2 秒不夸张：这 2 秒里没有任何额外代价，只是等它把这批库开完。
+    inline bool needNamePass() {
+        if (unnamedCount() == 0) return false;
+        const long long lastReg = g_lastRegMs.load(std::memory_order_relaxed);
+        if (lastReg != 0 && (nowMs() - lastReg) < 2000) return false;   // 还在开库，等它开完
+        return true;
+    }
+
+    // 按库名取句柄（零 SQL、零探测）。
+    // 同名可能有 2~3 个连接（WCDB 连接池）→ 取"连续失败最少"，再看"最近用过"的。
+    //
+    // ★ 为什么必须复核（实测翻车点）★
+    //   sqlite3* 地址会被复用：句柄 H 在 T 时刻是 message_0.db，关掉后被重新 open 成
+    //   emoticon.db —— 缓存里 H 还叫 message_0.db。结果是"查 message_0.db 却查到表情库"，
+    //   桥侧表现就是 `SELECT ... FROM Name2Id` → sqlite3_prepare failed。
+    //   复核方式：**只读**的 api->db_filename（不 prepare、不发 SQL、不碰表），
+    //   拿到权威名字不一致就当场改映射。db_filename 只读 db->aDb[0].zDbSName，成本纳秒级。
+    // 安全地把 db_filename 的结果拷成 std::string。
+    // 为什么要先 IsReadableRegion(fn,1)：db_filename 只返回一个 const char*，
+    // 万一对象已被释放（堆块被别的分配复用），这个指针可能是垃圾 → 直接 std::string(fn)
+    // 会解引用野指针。先确认那一字节可读、再限长，风险就收敛成"拿不到名字"。
+    // 独立的 SEH 包装：只调 db_filename，函数里没有任何带析构的 C++ 对象，
+    // 所以 MSVC 允许在这里用 __try（放进 safeDbName 会报 C2712「要求对象展开」）。
+    // 计数器：SEH 兜住了多少次野指针（没这个数就分不清"没遇到"和"兜住了但没留痕"）
+    inline std::atomic<unsigned>& sehDbFilenameHits() {
+        static std::atomic<unsigned> v{0};
+        return v;
+    }
+
+    inline const char* sehDbFilename(void* handle) {
+        __try {
+            return (const char*)g_api->db_filename((sqlite3*)handle, "main");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            sehDbFilenameHits().fetch_add(1, std::memory_order_relaxed);
+            return nullptr;      // 野指针 → 当成"拿不到名字"，绝不崩
+        }
+    }
+
+    // ★★ 2026-10-22 修（第三次崩溃，23:16:07）★★
+    //  旧实现的致命缺陷：只有 db_filename **调用本身**在 SEH 里，返回的 const char*
+    //  后面的每一次解引用全在 SEH 外：
+    //      if (fn == nullptr || *fn == '\0') ...      ← ① 野指针解引用
+    //      if (!IsReadableRegion(fn, 1)) ...          ← 检查写在 ① 之后，等于没用
+    //      while (n < 512 && fn[n] != '\0') ...       ← ② 盲读 512 字节，越界必崩
+    //  db_filename 对已释放的句柄可能返回非空但指向已回收堆块的指针；
+    //  那种指针 IsReadableRegion 可能是 true（页还在映射），读下去就是垃圾或崩。
+    //
+    //  为什么以前不崩：contact.db 被 retire 后 verifyName 根本不会被调用。
+    //  而 trusted 改成"tick 老化先 verifyName"之后，高频查 contact.db 就等于
+    //  给这个 bug 加了触发器 → 23:16:07 崩。
+    //
+    //  正确做法：把**整个字符串读取**包进 SEH，并且读到调用方提供的栈缓冲区里
+    //  （栈一定可写，不会因为写入再崩一次）。函数内无任何带析构的 C++ 对象，
+    //  避免 MSVC C2712「要求对象展开」。
+    inline bool sehReadDbName(void* handle, char* buf, size_t bufsz, size_t* outLen) {
+        __try {
+            const char* fn = (const char*)g_api->db_filename((sqlite3*)handle, "main");
+            if (fn == nullptr) return false;
+            size_t i = 0;
+            while (i + 1 < bufsz) {
+                const char c = fn[i];      // 越界/野指针在这里触发 SEH
+                if (c == '\0') break;
+                buf[i] = c;
+                ++i;
+            }
+            buf[i] = '\0';
+            *outLen = i;
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            sehDbFilenameHits().fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
+    inline bool safeDbName(void* handle, std::string& out) {
+        out.clear();
+        if (g_api == nullptr || g_api->db_filename == nullptr || handle == nullptr) return false;
+
+        char buf[512];
+        size_t n = 0;
+        if (!sehReadDbName(handle, buf, sizeof(buf), &n)) return false;   // 所有解引用都在 SEH 内
+        if (n == 0) return false;
+
+        // ★ 允许中文路径：db_filename 返回完整路径，中文字节 > 0x7E。
+        //   只挡控制字符（<0x20），然后 baseName() 取到 *.db 文件名（本身是 ASCII）。
+        for (size_t i = 0; i < n; ++i) {
+            if ((unsigned char)buf[i] < 0x20) return false;   // 控制字符 → 肯定是垃圾
+        }
+        out = baseName(std::string(buf, n));
+        return looksLikeDbName(out);
+    }
+
+    bool verifyName(void* handle, const std::string& expect) {
+        if (handle == nullptr) return false;
+        if (g_api == nullptr || g_api->db_filename == nullptr) return true;   // 拿不到槽位 → 不改判
+        std::string nm;
+        if (!safeDbName(handle, nm)) {
+        // 拿不到名字 → 不信任这个候选：WCDB 把连接关掉后地址还留在表里，
+        // db_filename 对已关闭的连接返回空串。以前这里"当它匹配"，结果一直把
+        // 已关闭的句柄发给桥 → prepare 返回 SQLITE_MISUSE(21)。
+        return false;
+        }
+        if (nm == expect) return true;
+        noteNamed(handle, nm);          // 地址复用 → 立刻纠正映射
+        return false;
+    }
+
+    // ── 轻量名字刷新（每 2 秒最多一次）────────────────────────────────
+    // 只用 api->db_filename：**只读、零 SQL、零锁、纳秒级**，不碰任何表。
+    // 专门对付"句柄被回收后地址被别的库复用"——这是缓存名过期的主因。
+    // 与 namePass（30 秒节流、可能发 PRAGMA 兜底）分工：这个负责"纠正"，那个负责"首轮取名"。
+    int refreshNamesFast() {
+        if (g_api == nullptr || g_api->db_filename == nullptr) return 0;
+        const long long now = nowMs();
+        long long prev = g_lastFastRefreshMs.load(std::memory_order_relaxed);
+        if (prev != 0 && (now - prev) < 2000) return 0;
+        if (!g_lastFastRefreshMs.compare_exchange_strong(prev, now)) return 0;
+        std::vector<std::string> names = copyNames();
+        int changed = 0;
+        for (int i = 0; i < (int)kSlotCount; ++i) {
+            Slot& s = g_slot[i];
+            const uintptr_t p = s.key.load(std::memory_order_relaxed);
+            if (p == 0 || p == 1) continue;
+            const long long tick = s.tick.load(std::memory_order_relaxed);
+            if (tick == 0 || (now - tick) > 120000) continue;      // 只刷新"最近用过"的
+            if (!IsReadableRegion((const void*)p, 64)) continue;
+            std::string nm;
+            if (!safeDbName((void*)p, nm)) continue;
+            const int idx = s.name.load(std::memory_order_relaxed);
+            const std::string cur = (idx > 0 && (size_t)idx <= names.size())
+                                  ? names[(size_t)idx - 1] : std::string();
+            if (cur == nm) continue;
+            const int ni = internName(nm);
+            if (ni > 0) { s.name.store(ni, std::memory_order_relaxed); ++changed; }
+        }
+        if (changed > 0) g_nameRefreshChanged.fetch_add(changed, std::memory_order_relaxed);
+        return changed;
+    }
+
+    void* findByName(const std::string& name) {
+        if (name.empty()) return nullptr;
+        // 最多两趟：第一趟找不到 → 做一次轻量名字刷新（纠正过期映射）再找一趟
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            if (attempt == 1) { if (refreshNamesFast() == 0) return nullptr; }
+            for (int round = 0; round < 2; ++round) {
+                std::vector<Entry> all = snapshot();
+                void* best = nullptr;
+                int bestFail = 1 << 30;
+                long long bestTick = -1;
+                for (size_t i = 0; i < all.size(); ++i) {
+                    if (all[i].name != name) continue;
+                    if (all[i].fail > bestFail) continue;
+                    if (all[i].fail == bestFail && all[i].tick <= bestTick) continue;
+                    best = all[i].handle;
+                    bestFail = all[i].fail;
+                    bestTick = all[i].tick;
+                }
+                if (best == nullptr) break;              // 这趟没有同名候选 → 交给下一趟刷新
+                if (verifyName(best, name)) return best;
+                // 名字过期 → verifyName 已改好映射，重来一轮
+            }
+        }
+        return nullptr;
+    }
+
+    // ── 诊断报告（GET /Debug/DBRescan）───────────────────────────────
+    // 纯只读：不跑任何 SQL、不改任何状态。
+    nlohmann::ordered_json reportRegistry() {
+        std::vector<Entry> all = snapshot();
+        const long long now = nowMs();
+        nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+        size_t named = 0;
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (!all[i].name.empty()) ++named;
+            nlohmann::ordered_json e;
+            e["handle"] = format_string("0x%llX", (unsigned long long)(uintptr_t)all[i].handle);
+            e["db"] = all[i].name;
+            e["fail_streak"] = all[i].fail;
+            e["age_ms"] = (all[i].tick > 0) ? (now - all[i].tick) : -1;
+            e["last_ok_ms_ago"] = (all[i].lastOk > 0) ? (now - all[i].lastOk) : -1;
+            e["last_fail_ms_ago"] = (all[i].lastFail > 0) ? (now - all[i].lastFail) : -1;
+            e["source"] = (all[i].src == 1) ? "open_v2" : (all[i].src == 2 ? "name_pass" : "prepare");
+            arr.push_back(e);
+        }
+        nlohmann::ordered_json j;
+        j["count"] = (int)all.size();
+        j["named"] = (int)named;
+        j["unnamed"] = (int)(all.size() - named);
+        j["entries"] = arr;
+        return j;
+    }
+
+    nlohmann::ordered_json reportCounters() {
+        nlohmann::ordered_json c;
+        c["registrations"] = (long long)g_registrations.load(std::memory_order_relaxed);
+        c["open_v2_names"] = (long long)g_openNamed.load(std::memory_order_relaxed);   // open_v2 detour 给出的库名条数
+        c["name_refresh_fixed"] = (long long)g_nameRefreshChanged.load(std::memory_order_relaxed); // 轻量刷新纠正的过期映射
+        c["pruned"] = (long long)g_pruned.load(std::memory_order_relaxed);
+        c["query_ok"] = (long long)g_queryOk.load(std::memory_order_relaxed);
+        c["query_fail"] = (long long)g_queryFail.load(std::memory_order_relaxed);
+        c["seh_dbfn"] = (long long)sehDbFilenameHits().load(std::memory_order_relaxed);   // db_filename 被 SEH 兜住的次数
+        c["suspect"] = (long long)g_suspect.load(std::memory_order_relaxed);
+        c["evicted"] = (long long)g_evicted.load(std::memory_order_relaxed);
+        c["self_heal_runs"] = (long long)g_healCount.load(std::memory_order_relaxed);
+        c["lookup_registry"] = (long long)g_hitRegistry.load(std::memory_order_relaxed);
+        c["lookup_cache"] = (long long)g_hitCache.load(std::memory_order_relaxed);
+        c["lookup_miss"] = (long long)g_miss.load(std::memory_order_relaxed);
+        long long ok = c["lookup_registry"].get<long long>() + c["lookup_cache"].get<long long>();
+        long long all = ok + c["lookup_miss"].get<long long>();
+        c["lookup_total"] = all;
+        c["lookup_ok"] = ok;
+        c["success_rate"] = (all > 0) ? (double)ok / (double)all : 0.0;
+        return c;
+    }
+
+    nlohmann::ordered_json reportNamePass() {
+        const long long now = nowMs();
+        const long long last = g_lastScanMs.load(std::memory_order_relaxed);
+        nlohmann::ordered_json j;
+        j["runs"] = (long long)g_namePassRuns.load(std::memory_order_relaxed);
+        j["skipped_busy"] = (long long)g_namePassSkipped.load(std::memory_order_relaxed);
+        j["throttled"] = (long long)g_namePassThrottled.load(std::memory_order_relaxed);
+        j["busy"] = (g_scanBusy.load(std::memory_order_relaxed) != 0);
+        j["last_ms_ago"] = (last > 0) ? (now - last) : -1;
+        j["last_attempted"] = g_passAttempted.load(std::memory_order_relaxed);
+        j["last_named"] = g_passNamed.load(std::memory_order_relaxed);
+        j["min_interval_ms"] = 30000;      // 全局最多每 30 秒扫一次（失败指数退避到 5 分钟）
+        j["consecutive_empty"] = g_emptyScans.load(std::memory_order_relaxed);
+        return j;
+    }
+
+    // ── detour: open_v2 ────────────────────────────────────────────────
+    //  微信每打开一个数据库就记下 {句柄 → 文件名}：名字最权威、且零成本。
+    typedef int (*open_v2_t)(const char*, sqlite3**, int, const char*);
+    open_v2_t g_origOpenV2 = nullptr;
+    bool g_installed = false;
+    bool g_installedCode = false;
+
     int detourOpenV2(const char* filename, sqlite3** ppDb, int flags, const char* zVfs) {
         int rc = g_origOpenV2 ? g_origOpenV2(filename, ppDb, flags, zVfs) : 1 /*SQLITE_ERROR*/;
         if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr && *filename != '\0') {
-            std::lock_guard<std::mutex> lg(g_mtx);
-            g_opened[(LPVOID)*ppDb] = baseName(std::string(filename));
+            noteOpened((void*)*ppDb, std::string(filename));
         }
-        // 探针：记录"这个 sqlite 实例打开过哪些库"（封顶 100 行）。
-        // 用途：判断 message_0.db 是不是同一个实例打开的 —— 这是区分"入口不同"和"另一个实例"的关键。
-        probe::onOpen(filename, rc, (ppDb != nullptr) ? (void*)*ppDb : nullptr);
         return rc;
     }
 
+    // ── detour: open（v1）────────────────────────────────────────────────
+    //  ★ 2026-10-22 实测：微信核心开库走的是 **v1 入口** sqlite3_open，不是 open_v2。
+    //    证据（/Debug/ApiTable 的 slots 地址，module_base = 0x7FFB71DB0000）：
+    //      open       0x7FFB75078E20  ← 在 Weixin.dll 内（真实 sqlite）
+    //      open_v2    0x7FFC3D618DE0  ← 在**另一个模块**（WCDB 封装层），从不被调用
+    //      db_filename 0x7FFB7507A9E0 ← 在 Weixin.dll 内
+    //    所以之前只 hook open_v2 → open_v2_names 恒为 0；
+    //    contact.db 这类「只在启动或低频访问时打开」的库永远进不了注册表，
+    //    桥就读不到（表现为 get database handle which named contact.db failed）。
+    //    补上 v1 入口后，**每次开库都会被记录**，不再依赖事后猜名字。
+    typedef int (*open_t)(const char*, sqlite3**);
+    open_t g_origOpen = nullptr;
+    bool g_installedOpenV1 = false;
 
-    // ── 方式三（应该能真正生效）：hook prepare ────────────────────────
-    // prepare 是每次查询都必走的路径，因此一定能拿到 sqlite3* 句柄。
-    // 拿到句柄后用 db_filename 问出文件名（只对没登记过的句柄做，之后零开销）。
+    int detourOpen(const char* filename, sqlite3** ppDb) {
+        int rc = g_origOpen ? g_origOpen(filename, ppDb) : 1 /*SQLITE_ERROR*/;
+        if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr && *filename != '\0') {
+            noteOpened((void*)*ppDb, std::string(filename));
+        }
+        return rc;
+    }
+
+    // ── detour: open16（宽字符版）────────────────────────────────────────
+    //  ★ 2026-10-22 第二次实测：`open_v1_code=true` 但 open_v2_names 恒为 0，
+    //    registrations 只有 prepare 抓到的 2 个。磁盘上 contact.db 明明 23:19:04 被写了
+    //    （微信确实打开了它），但没有任何 open hook 触发。
+    //    说明微信开库既不调 open、也不调 open_v2，而很可能调 **open16**（wchar 文件名）。
+    //    open16 的槽位地址 0x7FFB75079490 紧挨着 open 的 0x7FFB75078E20（同一模块），
+    //    是这个 sqlite 版本真正被使用的入口。
+    typedef int (*open16_t)(const void*, sqlite3**);
+    open16_t g_origOpen16 = nullptr;
+    bool g_installedOpen16 = false;
+
+    int detourOpen16(const void* filename, sqlite3** ppDb) {
+        int rc = g_origOpen16 ? g_origOpen16(filename, ppDb) : 1 /*SQLITE_ERROR*/;
+        // filename 是 UTF-16LE；用 WideCharToMultiByte 转成 UTF-8 再交给 noteOpened
+        if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr) {
+            char buf[512];
+            int n = ::WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)filename, -1,
+                                          buf, (int)sizeof(buf) - 1, nullptr, nullptr);
+            if (n > 1) {
+                buf[n - 1] = '\0';              // 去掉结尾的 \0
+                noteOpened((void*)*ppDb, std::string(buf));
+            }
+        }
+        return rc;
+    }
+
+    // ── detour: prepare ────────────────────────────────────────────────
+    //  prepare 是每次查询都必走的路径 —— 只要微信还在用这个库，句柄就一定新鲜且活着。
     typedef int (*prepare_t)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
     prepare_t g_origPrepare = nullptr;
     bool g_installedPrepare = false;
-    std::map<LPVOID, std::string> g_unknownHandles;   // 查不到文件名的句柄（避免反复查）
 
-    sqlite3_api_routines* g_api = nullptr;
+    inline bool prepareHookInstalled() { return g_installedPrepare && g_origPrepare != nullptr; }
+    inline bool openHookInstalled() { return ((g_installed || g_installedCode) && g_origOpenV2 != nullptr) || (g_installedOpenV1 && g_origOpen != nullptr); }
 
-    void noteHandle(sqlite3* db, sqlite3_api_routines* api) {
-        if (db == nullptr || api == nullptr || api->db_filename == nullptr) return;
-        {
-            std::lock_guard<std::mutex> lg(g_mtx);
-            if (g_opened.count((LPVOID)db) || g_unknownHandles.count((LPVOID)db)) return;
-        }
-        const char* fn = api->db_filename(db, "main");   // 第二个参数是连接内的库名（默认库 "main"）
-        std::lock_guard<std::mutex> lg(g_mtx);
-        if (fn != nullptr && *fn != '\0') {
-            g_opened[(LPVOID)db] = baseName(std::string(fn));
-        } else {
-            g_unknownHandles[(LPVOID)db] = "";   // 记下来，别再查
-        }
-    }
+
 
     // ══════════════════════════════════════════════════════════════════
     //  探针（第一轮：只观察不接管；第二轮：广谱 + 多入口 + 来源识别）
@@ -375,13 +942,11 @@ namespace db_registry {
                    (t[2] == 'G' || t[2] == 'g') && t[3] == '_';
         }
 
-        // 目标库名：句柄登记表里有就用，没有写 unknown（绝不主动去查库）
+        // 目标库名：直接从注册表读（零 API 调用、绝不主动去查库）
         inline std::string dbName(sqlite3* db) {
             if (db == nullptr) return "null-db";
-            std::lock_guard<std::mutex> lg(g_mtx);
-            auto it = g_opened.find((LPVOID)db);
-            if (it != g_opened.end() && !it->second.empty()) return it->second;
-            if (g_unknownHandles.count((LPVOID)db)) return "unknown";
+            Entry e;
+            if (entryByHandle((void*)db, e) && !e.name.empty()) return e.name;
             return "unknown";
         }
 
@@ -564,6 +1129,29 @@ namespace db_registry {
                 logCappedProbe(cLate, 20, "[PUSH-LATE] " + stamp()
                                + " 该语句在挂钩前就已 prepare，本次补上标记（本条无值，下一条起有值）\r\n");
             }
+        }
+
+        // ── 第三轮改造：**通知式**判定（不依赖标记 / 不依赖 bind 值）──────────
+        // 为什么单独写一个：Msg_ 的 INSERT 是挂钩前就 prepare 好的**缓存语句**，
+        // maybeMark() 那套标记只能在 step 时事后补、而且保持不住 → bind 值永远抓不到（实测 PUSH-CAP=0）。
+        // 这里在 step 成行时**直接按 SQL 判定**，命中就入队一条轻量通知（桥收到后立刻查一次库）。
+        // 纯内存 + 短临界区：微信线程上零网络、零阻塞；失败只是"这次不通知"（桥还有轮询兜底）。
+        inline void notifyIfMsgWrite(sqlite3_stmt* stmt) {
+            if (g_api == nullptr || g_api->sql == nullptr || stmt == nullptr) return;
+            const char* sql = g_api->sql(stmt);
+            if (sql == nullptr || *sql == '\0') return;
+            int k = 0;                                  // 廉价预筛：只有 INSERT/REPLACE 才值得解析
+            while (sql[k] == ' ' || sql[k] == '\t' || sql[k] == '\r' || sql[k] == '\n') ++k;
+            const char c = sql[k];
+            if (c != 'I' && c != 'i' && c != 'R' && c != 'r') return;
+
+            Sig g = makeSig(sql, -1);
+            if (g.kw1 != "INSERT" && g.kw1 != "REPLACE") return;
+            if (!isMsgTable(g.table)) return;           // 通知式只服务 Msg_*（消息行）
+            sqlite3* db = (g_api->db_handle != nullptr) ? (sqlite3*)g_api->db_handle(stmt) : nullptr;
+            const std::string dbn = dbName(db);
+            if (!isMessageDbName(dbn)) return;
+            msgpush::notifyWrite(dbn, g.table);
         }
 
         // UTF-16 的标记路径（prepare16_v2 / prepare16_v3）：先有界转 UTF-8，再走同一套判定
@@ -782,19 +1370,16 @@ namespace db_registry {
     step_t g_origStep = nullptr;
 
     int detourStep(sqlite3_stmt* stmt) {
-        void* caller = _ReturnAddress();
         int rc = g_origStep ? g_origStep(stmt) : 1;
-        // 第三轮：写语句成行（SQLITE_DONE）→ 打包 + 入队（纯内存操作，不联网）
-        if (rc == SQLITE_DONE && stmt != nullptr) {
-            // rowDone 返回 false = 这个 stmt 没被标记过 → 可能是在我们挂钩前就 prepare 好的缓存语句，
-            // 用 api->sql(stmt) 补标记（本条无值，下一条起有值）
-            if (!msgpush::rowDone(stmt)) {
-                probe::lateMarkFromStmt(stmt);
-            }
-        }
-        // 每个 stmt 对象只取样一次（环形缓存，无锁）；step 的热路径就是一次 load+比较
-        if (stmt != nullptr && !probe::stmtSeen((void*)stmt)) {
-            probe::onStep(stmt, rc, caller);
+        // 推送通道（第三轮）：**只在开关打开时**才做任何事。
+        // 默认是关的（hook-push.on 不存在）→ 这里只剩一次 relaxed 原子读，
+        // 不做 SQL 解析、不查表、不加锁、不打日志。
+        if (rc == SQLITE_DONE && stmt != nullptr && msgpush::enabled()) {
+            // ① 通知式（主路）：不依赖标记/绑定值，直接按 SQL 判定"这条是往 Msg_ 表写"，
+            //    命中就入队一条轻量通知，桥收到后立刻针对该群查一次库。
+            probe::notifyIfMsgWrite(stmt);
+            // ② 旧的值抓取路径保留（清标记，避免标记表泄漏）
+            if (!msgpush::rowDone(stmt)) probe::lateMarkFromStmt(stmt);
         }
         return rc;
     }
@@ -898,53 +1483,60 @@ namespace db_registry {
         return rc;
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ 下面这一组 detour 就是"红线②"的落地处 ★★
+    //  在 sqlite3_prepare 的 detour 里，除了 noteHot（记一条映射）之外**什么都不做**：
+    //    · 不调任何 sqlite API（不再有 db_filename / SELECT 1 / errcode）
+    //    · 不读微信的内存（除 detour 自己的入参 sql 指针；默认关的推送通道除外）
+    //    · 不做 I/O、不打日志（连 OutputDebugString 都没有）
+    //    · 不加锁：noteHot 是一次哈希 + 一次线性探测 + 一次 relaxed store
+    //  推送通道（msgpush，默认关）是唯一例外：开关打开时才会解析 SQL 做标记，
+    //  这里用一次 relaxed 原子读把它挡在门外。
+    // ══════════════════════════════════════════════════════════════════
     int detourPrepare(sqlite3* db, const char* sql, int n, sqlite3_stmt** stmt, const char** tail) {
-        void* caller = _ReturnAddress();     // 原调用者（MinHook 用 jmp 进 detour，返回地址不变）
-        int rc = g_origPrepare ? g_origPrepare(db, sql, n, stmt, tail) : 1;
-        // 只在成功且句柄未知时才登记（noteHandle 内部会先查表，开销可忽略）
-        if (db != nullptr) {
-            noteHandle(db, g_api);
+        // SEH 兜底：万一还有漏网的野指针，在这里变成 SQLITE_MISUSE 而不是崩掉客户端。
+        // 注意 __try 里不能有带析构的 C++ 对象，所以只放一次函数调用。
+        int rc = SQLITE_MISUSE;
+        __try {
+            rc = g_origPrepare ? g_origPrepare(db, sql, n, stmt, tail) : 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            rc = SQLITE_MISUSE;           // 访问违例 → 当成句柄已失效，不往上抛
         }
-        // 探针：只记日志。不改 rc、不改出参、不拦截。
-        probe::onPrepare(db, sql, n, rc, stmt, caller);
-        probe::maybeMark(db, sql, n, rc, stmt);     // 第三轮：标记消息写语句
+        noteHot(db);                      // 唯一动作（O(1)、无锁、无 API）
+        if (rc == SQLITE_OK && msgpush::enabled()) {
+            probe::maybeMark(db, sql, n, rc, stmt);   // 仅在推送通道打开时执行
+        }
         return rc;
     }
 
     int detourPrepare16(sqlite3* db, const void* sql, int n, sqlite3_stmt** stmt, const void** tail) {
-        void* caller = _ReturnAddress();
         int rc = g_origPrepare16 ? g_origPrepare16(db, sql, n, stmt, tail) : 1;
-        if (db != nullptr) noteHandle(db, g_api);
-        probe::onSql16(db, sql, n, rc, stmt, "prepare16_v2", caller);
-        probe::markFromSql16(db, sql, n, rc, stmt);
+        noteHot(db);
+        if (rc == SQLITE_OK && msgpush::enabled()) probe::markFromSql16(db, sql, n, rc, stmt);
         return rc;
     }
 
     int detourPrepareV3(sqlite3* db, const char* sql, int n, unsigned int flags,
                         sqlite3_stmt** stmt, const char** tail) {
-        void* caller = _ReturnAddress();
         int rc = g_origPrepareV3 ? g_origPrepareV3(db, sql, n, flags, stmt, tail) : 1;
-        if (db != nullptr) noteHandle(db, g_api);
-        probe::onSql(db, sql, n, rc, stmt, "prepare_v3", caller);
-        probe::maybeMark(db, sql, n, rc, stmt);     // 实测消息写库走这个入口
+        noteHot(db);
+        if (rc == SQLITE_OK && msgpush::enabled()) {
+            probe::maybeMark(db, sql, n, rc, stmt);          // 实测消息写库走这个入口
+        }
         return rc;
     }
 
     int detourPrepare16V3(sqlite3* db, const void* sql, int n, unsigned int flags,
                           sqlite3_stmt** stmt, const void** tail) {
-        void* caller = _ReturnAddress();
         int rc = g_origPrepare16V3 ? g_origPrepare16V3(db, sql, n, flags, stmt, tail) : 1;
-        if (db != nullptr) noteHandle(db, g_api);
-        probe::onSql16(db, sql, n, rc, stmt, "prepare16_v3", caller);
-        probe::markFromSql16(db, sql, n, rc, stmt);
+        noteHot(db);
+        if (rc == SQLITE_OK && msgpush::enabled()) probe::markFromSql16(db, sql, n, rc, stmt);
         return rc;
     }
 
     int detourExec(sqlite3* db, const char* sql, sqlite3_callback cb, void* arg, char** errmsg) {
-        void* caller = _ReturnAddress();
         int rc = g_origExec ? g_origExec(db, sql, cb, arg, errmsg) : 1;
-        if (db != nullptr) noteHandle(db, g_api);
-        probe::onSql(db, sql, -1, rc, nullptr, "exec", caller);
+        noteHot(db);
         return rc;
     }
 
@@ -1008,14 +1600,13 @@ namespace db_registry {
         installOneHook((void*)api->bind_value,    (LPVOID)&detourBindValue,    (LPVOID*)&g_origBindValue,    "bind_value");
         installOneHook((void*)api->finalize,      (LPVOID)&detourFinalize,     (LPVOID*)&g_origFinalize,     "finalize");
 
-        probe::arm();   // 探针就绪（只记日志，见文件上方 probe 命名空间）
+        probe::arm();   // 推送通道（默认关）+ 日志出口就绪
     }
 
     // ── 方式二（真正生效的那个）：直接 hook open_v2 的函数代码 ──────────
     // 实测：微信核心开库时**不走** API 表（那张表是给扩展用的），
     //       所以改表没用。但 api->open_v2 本身就是"真实函数的地址"，
     //       直接 hook 这段代码即可。用 MinHook（自带指令边界处理，不会把指令截断）。
-    bool g_installedCode = false;
     void installCode(sqlite3_api_routines* api) {
         if (g_installedCode || api == nullptr || api->open_v2 == nullptr) return;
         g_installedCode = true;
@@ -1034,9 +1625,49 @@ namespace db_registry {
         if (MH_EnableHook(target) != MH_OK) {
             OutputDebugStringA("[db_registry] MH_EnableHook(open_v2) 失败，退回扫描方式\n");
             g_installedCode = false;
-            return;
         }
         OutputDebugStringA("[db_registry] open_v2 代码钩子已安装（数据库句柄按真实打开记录）\n");
+
+        // ★ 2026-10-22：再挂 v1 入口 —— 微信核心开库走这个。
+        //   open_v2 的槽位指向外部模块（WCDB 封装层），微信从不去调它，
+        //   所以只挂 open_v2 时 open_v2_names 恒为 0，contact.db 永远进不了注册表。
+        //   两个都挂是安全的：同一个库只会走其中一条路径，noteOpened 内部有去重。
+        if (api->open != nullptr &&
+            installOneHook((void*)api->open, (LPVOID)&detourOpen, (LPVOID*)&g_origOpen, "open")) {
+            g_installedOpenV1 = true;
+            OutputDebugStringA("[db_registry] open(v1) 代码钩子已安装（微信核心开库走这个入口）\n");
+        }
+
+        // ★ 2026-10-22 第三次：open(v1) 装了却从不触发（open_v2_names 恒 0，
+        //   registrations 只有 prepare 抓到的 2 个），而磁盘上 contact.db 明明被写过。
+        //   微信实际用的是 **open16**（wchar 文件名版）——补上这个入口。
+        if (api->open16 != nullptr &&
+            installOneHook((void*)api->open16, (LPVOID)&detourOpen16, (LPVOID*)&g_origOpen16, "open16")) {
+            g_installedOpen16 = true;
+            OutputDebugStringA("[db_registry] open16 代码钩子已安装（微信实际使用的开库入口）\n");
+        }
+    }
+
+    // ★ 2026-10-23 late-arm：构造时微信的 sqlite3_api_routines 表还没填，
+    //   api->open16 / api->open 都是 nullptr → 当时跳过的钩子之后再也不重试，
+    //   导致 contact.db（只在点通讯录时才打开）永远登记不上。
+    //   现在每次真实查询前补装一次（幂等，挂上就不再重复）。
+    void rearm(sqlite3_api_routines* api) {
+        if (api == nullptr) return;
+        if (!g_installedOpen16 && api->open16 != nullptr) {
+            if (installOneHook((void*)api->open16, (LPVOID)&detourOpen16, (LPVOID*)&g_origOpen16, "open16(late)")) {
+                g_installedOpen16 = true;
+                OutputDebugStringA("[db_registry] open16 钩子补装成功（late-arm）\n");
+            }
+        }
+        if (!g_installedOpenV1 && api->open != nullptr) {
+            if (installOneHook((void*)api->open, (LPVOID)&detourOpen, (LPVOID*)&g_origOpen, "open(late)")) {
+                g_installedOpenV1 = true;
+                OutputDebugStringA("[db_registry] open(v1) 钩子补装成功（late-arm）\n");
+            }
+        }
+        if (!g_installedCode && api->open_v2 != nullptr) installCode(api);
+        if (!g_installedPrepare && api->prepare != nullptr) installPrepare(api);
     }
 
     // 安装：把 API 表里的 open_v2 指向 detour（表在 .rdata，需要临时改页保护）
@@ -1059,20 +1690,9 @@ namespace db_registry {
         }
     }
 
-    // 取一份当前有效的记录（顺便剔除已被关闭的句柄）
-    std::map<std::string, LPVOID> snapshot(sqlite3_api_routines* api) {
-        std::map<std::string, LPVOID> out;
-        std::lock_guard<std::mutex> lg(g_mtx);
-        for (auto it = g_opened.begin(); it != g_opened.end(); ) {
-            if (api == nullptr || IsBadReadPtr(it->first, sizeof(LPVOID)) || api->errcode(it->first) == SQLITE_MISUSE) {
-                it = g_opened.erase(it);      // 已关闭，剔除
-                continue;
-            }
-            out[it->second] = it->first;
-            ++it;
-        }
-        return out;
-    }
+    // 说明：原来这里还有一个"open_v2 登记表快照"（snapshot），它会逐条对句柄做
+    // 只读探测 + "真能查"探测来剔除失效项 —— 那套主动探测已经全部删掉。
+    // 现在注册表只剩一个来源（g_slot 原子表），失效判定统一由 noteQueryResult 负责。
 }
 
 
@@ -1101,6 +1721,23 @@ namespace xmgr {
 		return out;
 	}
 
+	// 判断一个指针是否落在 Weixin.dll 模块内（从 PE 头取 SizeOfImage，最可靠）
+	// 为什么要它：backup_init 可能因为「表还没填好」而是 null/垃圾；
+	// 原来直接 backup_init + 0xAD 然后 WriteProcessMemory → 往随机地址写 14 字节 0x90 → 客户端崩。
+	// （实测：DLL 加载 2 秒就构造 DatabaseMgr 时，启动 9 秒后崩溃）
+	static bool inWeixinModule(const void* p) {
+		if (p == nullptr || g_hWeixinDll == nullptr) return false;
+		const uintptr_t base = (uintptr_t)g_hWeixinDll;
+		const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+		const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + (uintptr_t)dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+		const uintptr_t size = (uintptr_t)nt->OptionalHeader.SizeOfImage;
+		if (size == 0) return false;
+		const uintptr_t a = (uintptr_t)p;
+		return a >= base && a < base + size;
+	}
+
 	DatabaseMgr::DatabaseMgr() {
 		size_t module_base = (size_t)g_hWeixinDll;
 		m_sqlite3Rountines = (sqlite3_api_routines*)(module_base + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
@@ -1115,7 +1752,7 @@ namespace xmgr {
 		std::vector<BYTE> nopData(14, 0x90);
 		m_backupAsmCode.resize(nopData.size(), 0);
 		ReadProcessMemory(GetCurrentProcess(), patchAddress, m_backupAsmCode.data(), m_backupAsmCode.size(), nullptr);
-		WriteProcessMemory(GetCurrentProcess(), patchAddress, (LPCVOID)nopData.data(), nopData.size(), 0);
+		WriteProcessMemory(GetCurrentProcess(), patchAddress, (LPCVOID)nopData.data(), nopData.size(), nullptr);
 	}
 
 	DatabaseMgr::~DatabaseMgr() {
@@ -1128,6 +1765,7 @@ namespace xmgr {
 
 	nlohmann::ordered_json DatabaseMgr::execute(sqlite3* db, const std::string& sql)
 	{
+        db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
 		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		if (db == nullptr) {
 			rdata["status"] = -1;
@@ -1136,13 +1774,18 @@ namespace xmgr {
 		}
 		sqlite3_stmt* stmt = nullptr;
 		int rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
+		// ★★ 句柄好坏的**唯一**判据就在这里：真实查询的返回码。
+		//    我们不主动去试句柄；只有真实查询（桥发来的 SQL / 取名扫描 / backup）
+		//    返回连接级错误时，才给这个句柄记一次失败；成功一次就清零。
+		db_registry::noteQueryResult((void*)db, rc);
 		if (rc != SQLITE_OK) {
 			rdata["status"] = rc;
 			rdata["desc"] = format_string("execute %s failed", "sqlite3_prepare");
 			return rdata;
 		}
 		nlohmann::ordered_json items = nlohmann::ordered_json::array();
-		while (m_sqlite3Rountines->step(stmt) == SQLITE_ROW)
+		int stepRc = SQLITE_OK;
+		while ((stepRc = m_sqlite3Rountines->step(stmt)) == SQLITE_ROW)
 		{
 			int col_count = m_sqlite3Rountines->column_count(stmt);
 			nlohmann::ordered_json item;
@@ -1172,19 +1815,54 @@ namespace xmgr {
 			items.push_back(item);
 		}
 		m_sqlite3Rountines->finalize(stmt);
+		if (stepRc != SQLITE_DONE && stepRc != SQLITE_OK) {
+			db_registry::noteQueryResult((void*)db, stepRc);   // 执行期才暴露的连接级错误
+		}
 		rdata["data"] = items;
 		return rdata;
 	}
 
+	// ── 连续失败自愈（兜底）────────────────────────────────────────────
+	// 桥每 2.5 秒轮询 6 张表；偶尔拿不到句柄是正常的（message_1..9.db 本来就不存在，
+	// 微信的库是懒加载的）。但**连续** N 次拿不到，说明注册表可能真坏了
+	// （就是本次修的"句柄丢失"），此时做一次合并 + 一次带节流的取名扫描。
+	// 注意：**不 clear、不扫地址空间、不探测句柄**，只走公开的两条安全路径。
+	static std::atomic<int> s_handleFailStreak{ 0 };
+	static std::atomic<long long> s_lastHealMs{ 0 };
+	static const int kHealThreshold = 5;
+	static const long long kHealIntervalMs = 30000;
+
+	static void noteHandleMiss(DatabaseMgr& mgr, const std::string& dbname) {
+		int n = s_handleFailStreak.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n < kHealThreshold) return;
+		long long now = db_registry::nowMs();
+		long long prev = s_lastHealMs.load();
+		if (now - prev <= kHealIntervalMs) return;
+		if (!s_lastHealMs.compare_exchange_strong(prev, now)) return;
+		db_registry::g_healCount.fetch_add(1, std::memory_order_relaxed);
+		OutputDebugStringA(format_string(
+			"[db_mgr][self-heal] 连续 %d 次拿不到句柄（最近：%s），触发一次重扫（节流 30s，不清空缓存）\n",
+			n, dbname.c_str()).c_str());
+		mgr.searchDatabases();                 // 合并注册表 + 内部节流的取名扫描
+		bool found = mgr.hasDb(dbname);
+		OutputDebugStringA(format_string(
+			"[db_mgr][self-heal] 重扫完成：目标 %s %s\n",
+			dbname.c_str(), found ? "已恢复" : "仍不在").c_str());
+		if (found) s_handleFailStreak.store(0, std::memory_order_relaxed);
+	}
+
 	nlohmann::ordered_json DatabaseMgr::execute(const std::string& dbname, const std::string& sql)
 	{
+        db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
 		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		LPVOID dbHandle = getDatabaseHandle(dbname);
 		if (dbHandle == nullptr) {
 			rdata["status"] = -1;
 			rdata["desc"] = format_string("get database handle which named %s failed", dbname);
+			noteHandleMiss(*this, dbname);          // 连续失败 → 自愈兜底
 			return rdata;
 		}
+		s_handleFailStreak.store(0, std::memory_order_relaxed);   // 成功 → 清零
 		rdata = execute((sqlite3*)dbHandle, sql);
 		return rdata;
 	}
@@ -1259,122 +1937,382 @@ namespace xmgr {
 		return backup(pExistDbHandle, out_path);
 	}
 
+	// ══════════════════════════════════════════════════════════════════
+	//  searchDatabases：把注册表合并进缓存
+	//
+	//  ★ 根因修复点（与上一版最大的不同）★
+	//    原代码在"发现任意一条看起来无效"时执行 m_dbs.clear() —— 一次清空整张表；
+	//    而那条判据 IsReadableRegion(h,0x1000) 对**完全正常**的 sqlite3 句柄也会 false
+	//    （sqlite3 对象只有几百字节，堆块后面未必还有 4KB 可读页）。
+	//    于是桥的连续轮询反复把整张表清空 → 找不到 message_0.db →
+	//    "get database handle which named message_0.db failed" → 机器人静默失聪。
+	//    现在：逐条判定、逐条剔除，**绝不清空**；剔不剔由**真实查询的返回码**说了算。
+	//
+	//  ★ 也不在持锁状态下做任何慢操作：上一版在锁里扫整个地址空间，
+	//    桥每 2.5 秒一催就排队 → 客户端启动被拖到 3 分钟（scans=153）。
+	// ══════════════════════════════════════════════════════════════════
 	const std::map<std::string, LPVOID>& DatabaseMgr::searchDatabases() {
-		std::lock_guard<std::mutex> lg(m_searchDbMtx);
-		// ── 修复上游 bug ──────────────────────────────────────────────
-		// 原版：if (!g_IsLogin) { m_dbs.clear(); return m_dbs; }
-		// 但全项目**没有任何地方把 g_IsLogin 置 1**（AfterLoginInitThread 定义了却从未被调用），
-		// 于是 QueryDB 永远返回空 —— 表现就是 GetAllDBName 返回 []、
-		// execute 报 "get database handle which named MicroDB.db failed"。
-		// 改成自愈：不靠这个标志，直接扫描；扫到数据库就反推"已登录"。
-		if (m_dbs.size() > 0) {
-			for (auto& it : m_dbs) {
-				if (!IsReadableRegion(it.second, 0x1000) || m_sqlite3Rountines->errcode(it.second) == SQLITE_MISUSE) {
-					m_dbs.clear();
-					break;
+		// ── ① 逐条校验 + 合并注册表（持锁时间只够拷几个 map，微秒级）──────
+		{
+			std::lock_guard<std::mutex> lg(m_searchDbMtx);
+			// 剔掉"已经不在注册表里"的那一条（被 noteQueryResult 剔除 / 从未登记）
+			for (auto it = m_dbs.begin(); it != m_dbs.end(); ) {
+				if (!db_registry::isRegistered((uintptr_t)it->second)) {
+					it = m_dbs.erase(it);
+				} else {
+					++it;
 				}
 			}
-			if (m_dbs.size() > 0) {
-				g_IsLogin = 1;      // 句柄还有效 → 已登录
-				return m_dbs;
-			}
-		}
-		// ── 优先：用 open_v2 钩子登记的真实句柄 ──────────────────────
-		// 这条路不依赖任何内存布局假设，稳定得多（原扫描方式实测命中数会从 219 跳到 3）。
-		{
-			std::map<std::string, LPVOID> reg = db_registry::snapshot(m_sqlite3Rountines);
-			if (!reg.empty() && !db_registry::g_forceRescan) {
-				m_dbs = reg;
-				g_IsLogin = 1;
-				OutputDebugStringA("[db_mgr] 用 open_v2 登记表拿到数据库列表\n");
-				return m_dbs;
+			// 注册表 → 缓存（**合并**，不覆盖别的来源；同名的挑"失败最少 + 最新鲜"）
+			std::vector<db_registry::Entry> live = db_registry::snapshot();
+			for (size_t i = 0; i < live.size(); ++i) {
+				if (live[i].name.empty()) continue;
+				auto it = m_dbs.find(live[i].name);
+				if (it == m_dbs.end()) { m_dbs[live[i].name] = live[i].handle; continue; }
+				db_registry::Entry cur;
+				const bool curOk = db_registry::entryByHandle(it->second, cur);
+				if (!curOk || live[i].fail < cur.fail ||
+					(live[i].fail == cur.fail && live[i].tick > cur.tick)) {
+					it->second = live[i].handle;
+				}
 			}
 		}
 
-		// ── 兜底：登记表为空（钩子没装上，或库都是钩子安装前打开的）→ 走原来的扫描 ──
-		std::vector<LPVOID> results;
-		size_t vfs_addr = (size_t)g_hWeixinDll + XWECHAT_SQLITE3_VFS_OFFSET;
-		ScanPattern(GetCurrentProcess(), (BYTE*)&vfs_addr, sizeof(LPVOID), results);
-		for (size_t i = 0; i < results.size(); i++) {
-			auto result = results[i];
-			// 只探测一个指针大小远远不够：sqlite 会深入解引用，假句柄会踩到未映射页
-			if (IsReadableRegion(result, 0x1000)) {
-				int rc = m_sqlite3Rountines->errcode(result);
-				if (rc == SQLITE_OK) {
-					nlohmann::ordered_json queryResult = execute(result, "PRAGMA database_list");
-					// 加固：候选句柄里大多数不是真数据库，data 可能是空数组/null，
-					// 原来直接 ["data"][0]["file"].get<string>() 会抛异常，把整个扫描打断。
-					if (!queryResult.contains("data") || !queryResult["data"].is_array() || queryResult["data"].empty())
-						continue;
-					auto& row = queryResult["data"][0];
-					if (!row.contains("file") || !row["file"].is_string())
-						continue;
-					std::string dbpath = row["file"].get<std::string>();
-					if (dbpath.empty())
-						continue;
-					auto pos = dbpath.find_last_of("\\");
-					std::string dbname = dbpath.substr(pos + 1);
-					m_dbs[dbname] = result;
+		// ── ② 有句柄但没名字 → 一次（节流 + 单飞的）取名扫描 ─────────────
+		//    正在扫的时候，别的线程**直接返回现有缓存**（不排队、不并发扫）。
+		if (db_registry::needNamePass()) {
+			const int added = namePass();
+			if (added > 0) {
+				std::lock_guard<std::mutex> lg(m_searchDbMtx);
+				std::vector<db_registry::Entry> live = db_registry::snapshot();
+				for (size_t i = 0; i < live.size(); ++i) {
+					if (live[i].name.empty()) continue;
+					if (!m_dbs.count(live[i].name)) m_dbs[live[i].name] = live[i].handle;
 				}
 			}
 		}
-		// 扫到任何数据库就说明已经登录了（自愈，见上面的说明）
-		if (m_dbs.size() > 0) {
-			g_IsLogin = 1;
-			// 把扫描结果补进登记表：下次直接命中，不用再扫
-			{
-				std::lock_guard<std::mutex> lg(db_registry::g_mtx);
-				for (auto& kv : m_dbs) db_registry::g_opened[kv.second] = kv.first;
-			}
-		}
+
+		if (!m_dbs.empty() && g_IsLogin == 0) g_IsLogin = 1;   // 有句柄 = 已登录
 		return m_dbs;
+	}
+
+	// ── 给"已登记但还没名字"的句柄补名字 ─────────────────────────────
+	//  为什么只补名字、不做别的事：句柄是不是**真句柄**，由 prepare/open_v2 钩子证明
+	//  （它们刚刚真的被微信拿来执行过 SQL）；这里只是问一句"你是哪个库"。
+	//  绝不扫地址空间、绝不拿未验证的指针开刀、绝不发 SELECT 1 试探。
+	//
+	//  闸门（任务书要求）：
+	//    · 全局最多每 30 秒一次；
+	//    · 连续"扫了没收获"→ 指数退避，最多 5 分钟；
+	//    · 扫描进行中其他线程**直接返回**现有缓存（不排队等、不并发扫）。
+	//  返回 >0 = 本次补上的条数；0 = 扫了没收获；<0 = 没扫（节流中 / 别人正在扫）
+	int DatabaseMgr::namePass() {
+		if (db_registry::g_scanBusy.exchange(1) != 0) {
+			db_registry::g_namePassSkipped.fetch_add(1, std::memory_order_relaxed);
+			return -1;                                  // 扫描进行中 → 立刻回去用缓存
+		}
+		struct BusyGuard {
+			~BusyGuard() { db_registry::g_scanBusy.store(0, std::memory_order_relaxed); }
+		} busyGuard;
+
+		const long long now = db_registry::nowMs();
+		long long wait = 30000LL;                       // 全局下限：30 秒
+		const int empties = db_registry::g_emptyScans.load(std::memory_order_relaxed);
+		for (int i = 0; i < empties && wait < 300000LL; ++i) wait *= 2;   // 30→60→120→240→300(封顶)
+		if (wait > 300000LL) wait = 300000LL;
+		long long prev = db_registry::g_lastScanMs.load(std::memory_order_relaxed);
+		if (prev != 0 && (now - prev) < wait) {
+			db_registry::g_namePassThrottled.fetch_add(1, std::memory_order_relaxed);
+			return -1;                                  // 太快了，节流
+		}
+		if (!db_registry::g_lastScanMs.compare_exchange_strong(prev, now)) {
+			db_registry::g_namePassThrottled.fetch_add(1, std::memory_order_relaxed);
+			return -1;
+		}
+		db_registry::g_namePassRuns.fetch_add(1, std::memory_order_relaxed);
+
+		int added = 0;
+		int attempted = 0;
+		bool hadUnnamed = false;
+		std::vector<db_registry::Entry> all = db_registry::snapshot();
+		for (size_t i = 0; i < all.size(); ++i) {
+			if (all[i].name.empty()) hadUnnamed = true;
+			// 只处理"最近还在 SQL 入口出现过"的句柄 —— 冷了很久的有可能是已关闭的
+			if (all[i].tick == 0 || (now - all[i].tick) > 120000) continue;
+			// 内存闸门：只看**对象头部**能不能读，绝不用 0x1000 去看 4KB ——
+			// ★ 实测教训：IsReadableRegion(h, 0x1000) 对**完全正常**的 sqlite3 句柄也会 false
+			//   （对象只有几百字节，堆块后面未必还有 4KB 可读页）。用它当闸门会让第一轮取名
+			//   只成功 1 个、剩下的要等 30 秒后的下一轮 → 启动被拖到 58.7 秒（实测）。
+			if (!IsReadableRegion(all[i].handle, 64)) continue;
+			++attempted;
+
+			// ① 首选：api->db_filename —— **只读**（不 prepare、不发 SQL、不碰任何表），纳秒级。
+			//    它同时负责纠正"地址复用"造成的过期名字（实测：message_0.db 的句柄被回收后
+			//    重开成 emoticon.db，缓存名不改就会查错库）。
+			bool named = false;
+			if (db_registry::g_api != nullptr && db_registry::g_api->db_filename != nullptr) {
+				std::string fnm;
+				if (db_registry::safeDbName(all[i].handle, fnm)) {
+					if (fnm != all[i].name) { db_registry::noteNamed(all[i].handle, fnm); ++added; }
+					named = true;
+				}
+			}
+			if (named) continue;
+			if (!all[i].name.empty()) continue;
+
+			// ② 退路：真查询 PRAGMA database_list（db_filename 槽位不可用时才会走到）
+            // ★ 2026-10-22：这条退路会对句柄真的发 SQL，同样有野指针风险。
+            //   ordered_json 有析构函数，不能放进 __try，所以用"先探测可读"降风险 + 交给 prepare 的 SEH。
+            if (!IsReadableRegion(all[i].handle, 64)) continue;
+            nlohmann::ordered_json q = execute((sqlite3*)all[i].handle, "PRAGMA database_list");
+			if (!q.contains("data") || !q["data"].is_array() || q["data"].empty()) continue;
+			auto& row = q["data"][0];
+			if (!row.contains("file") || !row["file"].is_string()) continue;
+			const std::string dbpath = row["file"].get<std::string>();
+			if (dbpath.empty()) continue;
+			const std::string nm = db_registry::baseName(dbpath);
+			if (!db_registry::looksLikeDbName(nm)) continue;
+			db_registry::noteNamed(all[i].handle, nm);
+			++added;
+		}
+		db_registry::g_passAttempted.store(attempted, std::memory_order_relaxed);
+		db_registry::g_passNamed.store(added, std::memory_order_relaxed);
+		// 只有"确实有没名字的句柄、而且一个都没拿到"才算空扫（进指数退避）
+		db_registry::g_emptyScans.store((hadUnnamed && added == 0) ? (empties + 1) : 0,
+		                                std::memory_order_relaxed);
+		return added;
 	}
 
 	LPVOID DatabaseMgr::getDatabaseHandle(const std::string& dbname)
 	{
-		auto& dbs = searchDatabases();
-		if (m_dbs.find(dbname) != m_dbs.end())
-			return m_dbs[dbname];
+		if (dbname.empty()) return nullptr;
 
-		// 微信的数据库是**懒加载**的：message_0.db 只有在收发过消息之后才会被打开。
-		// 首次扫描时它还不存在，缓存里自然没有 → 原来这里直接返回 nullptr，
-		// 结果"轮询收消息"永远起不来。改为：找不到就清缓存重扫一次。
-		// 重扫是**全内存扫描**（较慢），所以做 30 秒节流，避免被高频调用时反复扫。
-		static std::atomic<long long> lastRescan{ 0 };
-		long long now = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
-			std::chrono::steady_clock::now().time_since_epoch()).count();
-		long long prev = lastRescan.load();
-		if (now - prev > 30000 && lastRescan.compare_exchange_strong(prev, now)) {
-			OutputDebugStringA("[db_mgr] 缓存里没有目标库，触发重扫\n");
-			m_dbs.clear();
-			// 关键：强制走真实扫描 —— 否则会被"登记表"挡住，永远发现不了新打开的库
-			db_registry::g_forceRescan = true;
-			searchDatabases();
-			db_registry::g_forceRescan = false;
-			if (m_dbs.find(dbname) != m_dbs.end())
-				return m_dbs[dbname];
+		// ── ① 注册表按名直查（命中也要判断可信：零 API、零 SQL、零锁）──────
+		//  为什么加这一步：原来的 ① 是「命中就直接 return」，而注册表里的句柄
+		//  在 WCDB 回收连接后会变成野指针 → sqlite3_prepare(野指针) → 客户端崩。
+		//  （实测 16:43:30 崩溃前，桥正在反复探测 message_1.db）
+		//  为什么不用 db_filename 验证：对已释放的句柄调它，校验本身就会崩。
+		LPVOID h = db_registry::findByName(dbname);
+		if (h != nullptr) {
+			db_registry::Entry e;
+			bool trusted = false;
+			if (db_registry::entryByHandle((void*)h, e)) {
+				// ★ 2026-10-22 修（第二次）：tick 是「open/prepare 入口时间」，**不是**
+				//   「上次成功读的时间」。低频访问的库（contact.db / contact_fts.db 只在
+				//   微信启动时 open 一次、或插件每 5 分钟读一次）tick 必然老化到 5 分钟，
+				//   于是被判成"死句柄" → retireHandle 立墓碑 → 该库**永久**读不到，
+				//   直到微信重新 open。实测：open(v1) hook 只是让它"第一次能登记"，
+				//   救不了后续被判死（22:41 又报 get database handle contact.db failed）。
+				//
+				//   新判据（分两级）：
+				//     · fail 计数是硬条件（连续真失败 ≥2 就真的不可信）
+				//     · tick 老化时**不直接判死**，先 SEH 验名字：
+				//       verifyName → safeDbName → sehDbFilename，全程有 SEH，
+				//       对已释放的野指针只会返回 false，绝不会崩。
+				//   这样既能挡住真野指针，又不会误杀活着的冷门库。
+				trusted = (e.fail < 2);
+				if (trusted && (db_registry::nowMs() - e.tick >= 300000)) {
+					trusted = db_registry::verifyName((void*)h, dbname);
+				}
+			}
+			if (trusted) {
+				db_registry::g_hitRegistry.fetch_add(1, std::memory_order_relaxed);
+				return h;
+			}
+			// 不可信 → 剔除这条，继续走 ②③ 重新找（绝不返回野指针）
+			db_registry::retireHandle((uintptr_t)h);
 		}
+
+		// ── ② m_dbs 缓存（只剔失效的那一条，绝不清空整表）───────────────
+		// 命中也要复核名字：句柄地址会被复用，缓存里那条可能已经改开成别的库了
+		// （实测：message_0.db 的句柄被回收后重开成 emoticon.db）。
+		{
+			std::lock_guard<std::mutex> lg(m_searchDbMtx);
+			auto it = m_dbs.find(dbname);
+			if (it != m_dbs.end()) {
+				const bool okName = db_registry::verifyName(it->second, dbname);
+				if (okName && db_registry::isRegistered((uintptr_t)it->second)) {
+					db_registry::g_hitCache.fetch_add(1, std::memory_order_relaxed);
+					return it->second;
+				}
+				m_dbs.erase(it);      // ★ 只剔这一条
+			}
+		}
+
+		// ── ③ 合并注册表（必要时触发一次带节流的取名扫描）───────────────
+		searchDatabases();
+		{
+			std::lock_guard<std::mutex> lg(m_searchDbMtx);
+			auto it = m_dbs.find(dbname);
+			if (it != m_dbs.end()) {
+				if (db_registry::verifyName(it->second, dbname) &&
+					db_registry::isRegistered((uintptr_t)it->second)) {
+					db_registry::g_hitCache.fetch_add(1, std::memory_order_relaxed);
+					return it->second;
+				}
+				m_dbs.erase(it);
+			}
+		}
+
+		// ── ④ 仍然没有：连续未命中 → 节流自愈（只重扫合并，**绝不清空**）──
+		// 微信的库是**懒加载**的：message_1..9.db 本来就可能不存在，所以"找不到"
+		// 是正常情况，绝不能因此清表（原代码就是在这里 m_dbs.clear() 的）。
+		noteHandleMiss(*this, dbname);
+		db_registry::g_miss.fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
 	}
 
 	nlohmann::ordered_json DatabaseMgr::getDatabaseInfo() {
 		nlohmann::ordered_json jdbs = nlohmann::ordered_json::array();
 		// 原版这里有 if (!g_IsLogin) return jdbs; —— 但 g_IsLogin 永远为 0，
-		// 首次调用必然返回空。去掉这个门（扫描本身会判断有没有数据库）。
+		// 首次调用必然返回空。去掉这个门（合并逻辑本身会判断有没有数据库）。
 
 		//OutputDebugStringA("[getDatabaseInfo] 用户已登录\n");
 
-		m_dbs.clear();
-		auto& dbs = searchDatabases();
-		for (auto& db : dbs) {
+		// ★ 这里原来有一句 m_dbs.clear()：一次"列库"就把整张句柄表清空，
+		//   正是"句柄丢失"的帮凶之一（清空后要靠重扫才能恢复）。已删除。
+		searchDatabases();
+		// 拷一份再遍历：桥的轮询线程会并发增删 m_dbs（迭代器失效 → 未定义行为）。
+		std::map<std::string, LPVOID> copy;
+		{
+			std::lock_guard<std::mutex> lg(m_searchDbMtx);
+			copy = m_dbs;
+		}
+		for (auto& db : copy) {
 			nlohmann::json jdb = { {"dbName",db.first},{"dbHandle",(size_t)db.second} };
-			
-			//std::string debugMsg = "[getDatabaseInfo] dbName " + db.first + "\n";
-			//OutputDebugStringA(debugMsg.c_str());
-
-			// jdb["dbKey"] = codec_get_key(db.second);
 			jdbs.push_back(jdb);
 		}
 		return jdbs;
 	}
+
+	bool DatabaseMgr::hasDb(const std::string& dbname) {
+		std::lock_guard<std::mutex> lg(m_searchDbMtx);
+		return m_dbs.find(dbname) != m_dbs.end();
+	}
+
+	// ── GET /Debug/DBRescan：纯只读快照 ──────────────────────────────
+	// 不跑任何 SQL、不改任何状态、不动 m_dbs —— 监控可以放心高频轮询。
+	// 想真扫一次用 POST {"force":true}（带 30 秒节流）。
+	nlohmann::ordered_json DatabaseMgr::dbRescanReport() {
+		nlohmann::ordered_json j;
+		{
+			std::lock_guard<std::mutex> lg(m_searchDbMtx);
+			const long long now = db_registry::nowMs();
+			nlohmann::ordered_json cache = nlohmann::ordered_json::array();
+			for (auto& kv : m_dbs) {
+				db_registry::Entry e;
+				const bool ok = db_registry::entryByHandle(kv.second, e);
+				nlohmann::ordered_json x;
+				x["db"] = kv.first;
+				x["handle"] = format_string("0x%llX", (unsigned long long)(uintptr_t)kv.second);
+				x["registered"] = ok;
+				x["fail_streak"] = ok ? e.fail : -1;
+				x["last_ok_ms_ago"] = (ok && e.lastOk > 0) ? (now - e.lastOk) : -1;
+				x["source"] = ok ? ((e.src == 1) ? "open_v2" : (e.src == 2 ? "name_pass" : (e.src == 3 ? "api_named" : "prepare"))) : "unknown";
+				cache.push_back(x);
+			}
+			j["cache"] = cache;
+			j["db_count"] = (int)m_dbs.size();
+			j["message_0_present"] = (m_dbs.find("message_0.db") != m_dbs.end());
+		}
+		nlohmann::ordered_json hooks = nlohmann::ordered_json::object();
+		hooks["prepare"] = db_registry::prepareHookInstalled();
+		hooks["open_v2"] = db_registry::openHookInstalled();
+		j["hooks"] = hooks;
+		j["registry"] = db_registry::reportRegistry();
+		j["name_pass"] = db_registry::reportNamePass();
+		j["counters"] = db_registry::reportCounters();
+		j["IsLogin"] = g_IsLogin;
+		j["note"] = "只读快照：不跑任何 SQL、不改任何状态；POST {\"force\":true} 才触发一次（30 秒节流）";
+		return j;
+	}
+
+	// ── POST /Debug/DBRescan {"force":true}：触发一次取名扫描 ───────────
+	// 带 30 秒节流：节流窗口内返回"太快了"而不是硬扫。
+	nlohmann::ordered_json DatabaseMgr::dbRescanForce() {
+		const int added = namePass();
+		nlohmann::ordered_json j;
+		if (added < 0) {
+			j["forced"] = false;
+			j["throttled"] = true;
+			j["message"] = "太快了：取名扫描最多每 30 秒一次（连续没收获会指数退避到 5 分钟）";
+		} else {
+			j["forced"] = true;
+			j["added"] = added;
+			j["message"] = format_string("扫完了，本次补上 %d 个库名", added);
+		}
+		searchDatabases();                    // 合并进缓存（逐条维护，绝不清空）
+		j["report"] = dbRescanReport();
+		return j;
+	}
+	// ══════════════════════════════════════════════════════════════════
+	//  API 表诊断（2026-10-21）
+	//  背景：外部部署反馈「GetAllDBName 能列库，但 QueryDB/execute 一律
+	//        get database handle which named xxx failed」，且 registry 里
+	//        prepare 抓到的句柄 db 名为空。
+	//  取名靠 api->db_filename；如果那个槽位是 null，名字永远为空 →
+	//        按名查找必然全 miss。
+	//  这里把每个关键槽位的**地址**和**是否落在 Weixin.dll 模块内**列出来，
+	//  一眼就能分清：钩子没装上 vs 装了但入口不对 vs 槽位为空。
+	//  红线：纯只读，不调任何 sqlite API、不发 SQL、不改状态。
+	// ══════════════════════════════════════════════════════════════════
+	nlohmann::ordered_json DatabaseMgr::apiTableReport() {
+		nlohmann::ordered_json j;
+		const uintptr_t base = (uintptr_t)g_hWeixinDll;
+		const uintptr_t size = (uintptr_t)g_MyModuleSize;
+		const uintptr_t end = base + size;
+
+		j["module_base"] = format_string("0x%llX", (unsigned long long)base);
+		j["module_size"] = (unsigned long long)size;
+		j["module_end"] = format_string("0x%llX", (unsigned long long)end);
+		j["api_table"] = format_string("0x%llX", (unsigned long long)(uintptr_t)m_sqlite3Rountines);
+		j["api_table_in_module"] = (base != 0 && (uintptr_t)m_sqlite3Rountines >= base
+		                            && (uintptr_t)m_sqlite3Rountines < end);
+		j["IsLogin"] = g_IsLogin;
+
+		nlohmann::ordered_json slots = nlohmann::ordered_json::object();
+		auto probe = [&](const char* name, const void* fn) {
+			nlohmann::ordered_json x;
+			const uintptr_t p = (uintptr_t)fn;
+			x["addr"] = format_string("0x%llX", (unsigned long long)p);
+			x["is_null"] = (p == 0);
+			x["in_module"] = (base != 0 && size != 0 && p >= base && p < end);
+			x["readable"] = (p != 0 && IsReadableRegion((const void*)p, 1));
+			slots[name] = x;
+		};
+
+		if (m_sqlite3Rountines != nullptr) {
+			probe("open",         (const void*)m_sqlite3Rountines->open);
+			probe("open16",       (const void*)m_sqlite3Rountines->open16);
+			probe("open_v2",      (const void*)m_sqlite3Rountines->open_v2);
+			probe("prepare",      (const void*)m_sqlite3Rountines->prepare);
+			probe("prepare16",    (const void*)m_sqlite3Rountines->prepare16);
+			probe("prepare_v3",   (const void*)m_sqlite3Rountines->prepare_v3);
+			probe("prepare16_v3", (const void*)m_sqlite3Rountines->prepare16_v3);
+			probe("db_filename",  (const void*)m_sqlite3Rountines->db_filename);
+			probe("db_handle",    (const void*)m_sqlite3Rountines->db_handle);
+			probe("exec",         (const void*)m_sqlite3Rountines->exec);
+			probe("step",         (const void*)m_sqlite3Rountines->step);
+			probe("finalize",     (const void*)m_sqlite3Rountines->finalize);
+		} else {
+			j["api_table_null"] = true;
+		}
+		j["slots"] = slots;
+
+		j["hooks_installed"] = {
+			{ "open_v2_code", db_registry::openHookInstalled() },
+			{ "open_v1_code", db_registry::g_installedOpenV1 && db_registry::g_origOpen != nullptr },
+			{ "prepare",      db_registry::prepareHookInstalled() },
+		};
+		j["counters"] = {
+			{ "registrations",  (long long)db_registry::g_registrations.load(std::memory_order_relaxed) },
+			{ "open_v2_names",  (long long)db_registry::g_openNamed.load(std::memory_order_relaxed) },
+			{ "name_pass_runs", (long long)db_registry::g_namePassRuns.load(std::memory_order_relaxed) },
+		};
+		j["note"] = "纯只读快照：不调任何 sqlite API、不发 SQL、不改任何状态";
+
+		return j;
+	}
+
+
 }
