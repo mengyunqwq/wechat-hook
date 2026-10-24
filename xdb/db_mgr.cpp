@@ -1765,6 +1765,7 @@ namespace xmgr {
 
 	nlohmann::ordered_json DatabaseMgr::execute(sqlite3* db, const std::string& sql)
 	{
+        std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：避免 httplib 两个工作线程同时进客户端 sqlite
         db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
 		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		if (db == nullptr) {
@@ -1853,6 +1854,7 @@ namespace xmgr {
 
 	nlohmann::ordered_json DatabaseMgr::execute(const std::string& dbname, const std::string& sql)
 	{
+        std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：避免 httplib 两个工作线程同时进客户端 sqlite
         db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
 		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		LPVOID dbHandle = getDatabaseHandle(dbname);

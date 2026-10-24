@@ -4,6 +4,7 @@
 #include "GetSelfProfile.h"
 #include "ForwardXMLMsg.h"
 #include "SendImageMsg.h"
+#include "SendVoiceMsg.h"
 #include "QueryDB.h"
 
 void RegisterRoutes(httplib::Server& svr)
@@ -12,5 +13,6 @@ void RegisterRoutes(httplib::Server& svr)
     RegisterGetSelfProfile(svr);
     Route_ForwardXMLMsg(svr);
     Route_SendImageMsg(svr);
+    Route_SendVoiceMsg(svr);
     Route_QueryDB(svr);
 }

@@ -37,6 +37,8 @@ namespace msgpush {
     static const int    kLogCapSent    = 300;          // [PUSH-SENT] 上限
     static const int    kLogCapFail    = 120;          // [PUSH-FAIL] 上限
     static const int    kLogCapMark    = 40;           // [PUSH-MARK] 上限
+    static const int    kLogCapNotify  = 60;           // [PUSH-NOTIFY] 上限
+    static const int    kNotifyGapMs   = 500;          // 同表通知最小间隔（去重，防一次写入多条语句刷屏）
     static const int    kWorkerSleepMs = 250;          // 工作线程轮询间隔（复查开关 + 排空）
     static const int    kDrainPerTick  = 8;            // 每轮最多发几条
 
@@ -68,9 +70,14 @@ namespace msgpush {
     static std::mutex g_qMtx;                           // 保护 g_q
     static std::deque<std::string> g_q;
 
+    // 通知式推送的去重表：表名 → 上次通知时间（独立锁，不跟 bind 路径抢 g_mtx）
+    static std::mutex g_nMtx;
+    static std::map<std::string, long long> g_lastNotify;
+
     // 各类日志的已打印条数（用于封顶）
     static std::atomic<long long> g_cCapLog{ 0 }, g_cMark{ 0 }, g_cSent{ 0 },
-                                  g_cFail{ 0 }, g_cDrop{ 0 }, g_cQueued{ 0 }, g_cSkip{ 0 };
+                                  g_cFail{ 0 }, g_cDrop{ 0 }, g_cQueued{ 0 }, g_cSkip{ 0 },
+                                  g_cNotify{ 0 };
 
     // ── 小工具 ──────────────────────────────────────────────────────
     static std::string stamp() {
@@ -402,44 +409,9 @@ namespace msgpush {
         }
     }
 
-    static void emitRow(sqlite3_stmt* stmt, const Cap& c) {
-        // ① 摘要日志：一定有（便于验收：表名 + 每列的 名字:类型:长度）
-        std::string colsum;
-        for (std::map<int, int>::const_iterator it = c.typ.begin(); it != c.typ.end(); ++it) {
-            int idx = it->first;
-            int len = 0;
-            std::map<int, std::string>::const_iterator vit = c.val.find(idx);
-            if (vit != c.val.end()) len = (int)vit->second.size();
-            if (!colsum.empty()) colsum += ",";
-            colsum += colNameAt(c, idx) + ":" + typeName(it->second) + ":" + std::to_string(len);
-        }
-        logCapped(g_cCapLog, kLogCapCap,
-                  "[PUSH-CAP] " + stamp() + " db=" + c.db + " table=" + c.table
-                  + " stmt=0x" + ptrHex(stmt)
-                  + " nbind=" + std::to_string(c.typ.size())
-                  + " push=" + (c.pushable ? (g_enabled.load() ? "yes" : "no(开关关)") : "no(非Msg_表)")
-                  + (c.truncated ? " TRUNCATED" : "")
-                  + " cols=[" + colsum + "]\r\n");
-
-        // ② 只有"要推给桥的行"（表名 Msg_*）且开关打开，才打包 + 入队
-        if (!c.pushable) return;
-        if (!g_enabled.load(std::memory_order_relaxed)) return;
-
-        std::string cols = "{";
-        bool first = true;
-        for (std::map<int, std::string>::const_iterator it = c.val.begin(); it != c.val.end(); ++it) {
-            if (!first) cols += ",";
-            first = false;
-            cols += "\"" + jsonEscape(colNameAt(c, it->first)) + "\":" + it->second;
-        }
-        cols += "}";
-
-        std::string json = "{\"t\":\"msg\",\"db\":\"" + jsonEscape(c.db)
-                         + "\",\"table\":\"" + jsonEscape(c.table)
-                         + "\",\"stmt\":\"0x" + ptrHex(stmt)
-                         + "\",\"cols\":" + cols
-                         + ",\"ts\":" + std::to_string(epochMillis()) + "}";
-
+    // 入队（有界，满了丢最旧并计数）—— emitRow 与 notifyWrite 共用。
+    // 纯内存 + 短临界区：微信线程上零网络、零阻塞。
+    static void pushQueue(std::string json, const std::string& table) {
         bool droppedOld = false;
         size_t qsz = 0;
         {
@@ -459,8 +431,76 @@ namespace msgpush {
                       + ")，丢弃最旧，累计丢弃=" + std::to_string(g_dropped.load()) + "\r\n");
         }
         logCapped(g_cQueued, 60,
-                  "[PUSH-QUEUE] " + stamp() + " table=" + c.table
+                  "[PUSH-QUEUE] " + stamp() + " table=" + table
                   + " 入队，队列=" + std::to_string(qsz) + "\r\n");
+    }
+
+    static void emitRow(sqlite3_stmt* stmt, const Cap& c) {
+        // ① 摘要日志：一定有（便于验收：表名 + 每列的 名字:类型:长度）
+        std::string colsum;
+        for (std::map<int, int>::const_iterator it = c.typ.begin(); it != c.typ.end(); ++it) {
+            int idx = it->first;
+            int len = 0;
+            std::map<int, std::string>::const_iterator vit = c.val.find(idx);
+            if (vit != c.val.end()) len = (int)vit->second.size();
+            if (!colsum.empty()) colsum += ",";
+            colsum += colNameAt(c, idx) + ":" + typeName(it->second) + ":" + std::to_string(len);
+        }
+        logCapped(g_cCapLog, kLogCapCap,
+                  "[PUSH-CAP] " + stamp() + " db=" + c.db + " table=" + c.table
+                  + " stmt=0x" + ptrHex(stmt)
+                  + " nbind=" + std::to_string(c.typ.size())
+                  + " push=" + (c.pushable ? (g_enabled.load() ? "yes" : "no(开关关)") : "no(非Msg_表)")
+                  + (c.truncated ? " TRUNCATED" : "")
+                  + " cols=[" + colsum + "]\r\n");
+
+        // ② 第三轮改造：**不再从 bind 值打包推送**（值抓不到 —— 见 notifyWrite 的说明）。
+        //    投递统一走"通知式"：msgpush::notifyWrite(db, table)，由 db_mgr.cpp 的 step 探针调用。
+        //    这里只保留上面的 [PUSH-CAP] 行诊断（nbind 恒为 0 就是"值抓不到"的直接证据）。
+    }
+
+    // ── 通知式推送（第三轮改造的主路）────────────────────────────────
+    // 只发"某个 Msg_ 表刚被写了"，**不带任何列/值**。桥收到后立刻针对该群查一次库。
+    // 为什么不带值：Msg_ 的 INSERT 是挂钩前就 prepare 好的缓存语句，标记只能在 step 时补、
+    // 且保持不住（实测 [PUSH-CAP] nbind=0 一条都没有、[PUSH-LATE] 反复 20 次）→ 值永远抓不到。
+    // 通知式绕开整个语句缓存问题；而且通知触发那一刻库必然是开着的（微信刚写完）——
+    // 这才是真正根治"轮询空窗"的点。
+    void notifyWrite(const std::string& db, const std::string& table) {
+        if (table.empty()) return;
+
+        if (!g_enabled.load(std::memory_order_relaxed)) {
+            logCapped(g_cNotify, 20,
+                      "[PUSH-NOTIFY] " + stamp() + " db=" + db + " table=" + table
+                      + " push=no(开关关)\r\n");
+            return;
+        }
+
+        // 同表 500ms 去重：一次消息写入往往伴随多条语句（还有 message_fts 等），避免刷屏。
+        // 纯内存 + 独立锁，不跟 bind 路径抢锁。
+        {
+            const long long now = epochMillis();
+            std::lock_guard<std::mutex> lg(g_nMtx);
+            long long& last = g_lastNotify[table];
+            if (last != 0 && now - last < (long long)kNotifyGapMs) return;
+            last = now;
+            // 防表名无限增长（正常就几个群；顺手清掉 60s 前的陈旧项）
+            if (g_lastNotify.size() > 256) {
+                for (std::map<std::string, long long>::iterator it = g_lastNotify.begin();
+                     it != g_lastNotify.end(); ) {
+                    if (now - it->second > 60000) it = g_lastNotify.erase(it);
+                    else ++it;
+                }
+            }
+        }
+
+        std::string json = "{\"t\":\"msg\",\"db\":\"" + jsonEscape(db)
+                         + "\",\"table\":\"" + jsonEscape(table)
+                         + "\",\"notify\":1"
+                         + ",\"ts\":" + std::to_string(epochMillis()) + "}";
+        logCapped(g_cNotify, kLogCapNotify,
+                  "[PUSH-NOTIFY] " + stamp() + " db=" + db + " table=" + table
+                  + " 通知入队（通知式：不抓值，桥自行查库）\r\n");
+        pushQueue(std::move(json), table);
     }
 
     bool rowDone(sqlite3_stmt* stmt) {

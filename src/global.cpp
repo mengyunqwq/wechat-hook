@@ -16,6 +16,7 @@ HWND    g_WeixinMainHwnd = nullptr;
 volatile uint64_t g_IsLogin = 0;
 volatile uint64_t g_getprofile = 0;
 CRITICAL_SECTION g_dbMgrCriticalSection;
+std::recursive_mutex g_clientCallMutex;
 
 volatile bool g_LoginMonitorRunning = true;
 std::string g_CallBack_Url;

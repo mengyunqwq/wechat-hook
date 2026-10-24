@@ -1312,6 +1312,7 @@ namespace WeixinSend
 
     void SendImage(const std::string& wxid, const std::string& imgPath)
     {
+        std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：发送与查库不能同时进客户端
         uintptr_t WeixinDLL_baseAddr = GetWeixinDllBase();
 
         uint64_t* msgStruct = (uint64_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x7C0);
@@ -1410,6 +1411,7 @@ namespace WeixinSend
     void SendText(const std::string& wxidorgid, const std::string& msg,
                   const std::string& atlist)
     {
+        std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：发送与查库不能同时进客户端
         uintptr_t base = GetWeixinDllBase();
 
 		//不同版本需要调整 msgBuf 大小，过小会导致发送失败，过大会浪费内存 
@@ -2025,6 +2027,7 @@ namespace WeixinSend
                   uint32_t durationMs, const std::string& str0Mode,
                   const std::string& str0Raw, std::string* detailJson)
     {
+        std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：发送与查库不能同时进客户端
         using namespace voicesend;
 
         std::string detail = "{}";

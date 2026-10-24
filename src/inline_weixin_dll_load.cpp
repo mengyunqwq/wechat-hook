@@ -18,6 +18,8 @@
 #include "wx_ini_reader.h"
 #include "inline_weixin_dll_load.h"
 #include "hook_xlog.h"
+#include "wx_send.h"
+#include "VoiceUploadProbe.h"
 
 
 
@@ -193,6 +195,17 @@ void Evt_WeixinLoad()
     //InitStandardPaths();
     
     Patch_Revoke();
+
+    // ── VOICE-DUMP：只读埋点（默认关）──────────────────────────────
+    // 起一条一次性线程，延迟 1.5s 再挂 send_message / 语音构造器的只读 detour。
+    // 刻意不在这里直接挂：本函数跑在 DllMain 里（loader lock），MinHook 挂钩会
+    // 挂起线程 —— 万一撞上就卡启动。挂不上最多是没数据，绝不影响微信。
+    WeixinSend::StartVoiceDumpHookThread();
+
+    // ── VUPROBE：语音"上传"链路只读埋点（默认关，开关文件 hook-vuprobe.on）
+    // 挂的是 CDN 上传入口 / uploadvoice CGI / 语音消息工厂等候选点；
+    // 只读 dump 入参、返回值、SILK 魔数、本地路径，绝不改控制流。
+    VuProbe::StartThread();
 
 
     // 创建并启动HTTP服务器

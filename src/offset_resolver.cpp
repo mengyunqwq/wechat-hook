@@ -102,6 +102,7 @@ namespace {
         if (n == "img_msg_vtb2")                         { offset::img_msg_vtb2 = value; return; }
         if (n == "g_Patch_Revoke")                       { g_Patch_Revoke = value; return; }
         if (n == "xlog_hook_target")                     { g_xlogHookTarget = value; return; }
+        if (n == "voice_msg_ctr")                        { offset::voice_msg_ctr = value; return; }
         if (n == "XWECHAT_MAIN_CLAZZ_OFFSET")            { g_xwechatMainClazz = value; return; }
     }
 }

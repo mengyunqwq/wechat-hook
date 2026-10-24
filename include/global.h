@@ -1,3 +1,4 @@
+#include <mutex>
 #pragma once
 #include <windows.h>
 #include <string>
@@ -28,6 +29,7 @@ extern volatile uint64_t g_getprofile;
 extern volatile bool g_LoginMonitorRunning;
 extern std::string g_CallBack_Url;
 extern CRITICAL_SECTION g_dbMgrCriticalSection;
+extern std::recursive_mutex g_clientCallMutex;   // 串行化 hook 对客户端的调用（sqlite/发送）
 
 extern std::wstring g_AppDataDir;
 extern std::wstring g_DocumentDir;
@@ -89,6 +91,42 @@ namespace offset
     inline uintptr_t txt_message_vtbl = 0x8279358;
     inline uint64_t img_msg_vtbl = 0x84F96B8; 
     inline uint64_t img_msg_vtb2 = 0x84F9748;
+
+    // ── 语音消息（4.1.10.27 实测）────────────────────────────────────
+    // 微信自己的语音构造器：new(0x208) → [+0x00] = voice_msg_vtbl（外层包装 vtable）
+    //                                    [+0x08] = 0x100000001
+    //                                    [+0x10] = voice_msg_vtbl2（内层 vtable，真正的类型判别）
+    // 消息类型字段：内层 +0x0C == 34 / 0x22 表示语音（判定函数 Weixin.dll+0xA4BBF0）
+    // 内层字段（相对内层 = 对象 +0x10）：+0x140 commenturl、+0x180 aeskey、+0x1A0 length、
+    //   +0x1A4 voicelength(ms)、+0x1A8 voiceformat、+0x1AC endflag、+0x1B0 cancelflag、
+    //   +0x1B4 forwardflag、+0x1B8 voiceurl、+0x1D8 string（转 XML 时没用到的槽，本地 SILK 路径的头号嫌疑）
+    // ⚠️ 两个 vtable 都是"数据目标"：按 offset_resolver.cpp:143-145 的闸门，
+    //    数据目标永远用硬编码值（特征码只对代码目标生效），所以这里就是最终值。
+    inline uint64_t voice_msg_ctr = 0xA203B0;      // 代码目标 → 可被特征码覆盖
+    inline uint64_t voice_msg_vtbl = 0x82FCB68;    // 数据目标 → 永远硬编码
+    inline uint64_t voice_msg_vtbl2 = 0x82FCBF8;   // 数据目标 → 永远硬编码
+    // ⚠️ 上面三个是【解析/DB 侧】的语音类（0x208 字节，ctor 0xA203B0，唯一调用者 = 解析工厂 0xA1FB00）。
+    //    发语音气泡用的是【发送侧】那一族（0x778 字节），见下面 4 个：
+
+    // ── 发送侧语音消息（4.1.10.27 静态分析 + 实测，/SendVoiceMsg 用）────────
+    //   真实发送链：0x54B02A0(录音状态机) → 0x6199D10 → 工厂 0x619A190 → 0x1649B50
+    //   工厂签名（与调用点 0x619A1E5..0x619A1F6 逐条对齐）：
+    //     factory(out[2] /*rcx: out[0]=内层 inner, out[1]=外层 outer*/,
+    //             const std::string* 收件人 /*rdx*/,
+    //             const std::string* str0   /*r8, 拷到 inner+0x708*/,
+    //             const uint32_t*    时长ms /*r9, 取值 *r9 → inner+0x728*/,
+    //             const void*        arg5   /*栈, 16B→inner+0x730, [0x10]→inner+0x740,
+    //                                          +0x18 的 std::string → inner+0x748*/)
+    //   工厂内部：new(0x778) → [+0x00]=外层 vtable、[+0x08]=tag 0x100000001、
+    //             [+0x18]=inner、[+0x20]=控制块（自引用 shared_ptr）→ 调内层 ctor。
+    //   内层 ctor 只做"拷贝字符串 + 存标量"，并调基类 ctor 0x6B2D30
+    //   （基类 ctor 里用 0x4DF240 生成的 GUID 写 inner+0x6A8）。
+    inline uint64_t voice_send_factory = 0x619A190;   // 代码目标（工厂）
+    inline uint64_t voice_send_ctr     = 0x619B3B0;   // 代码目标（内层 ctor）
+    inline uint64_t voice_send_outer_vtbl = 0x8DCFF98;// 数据目标（外层包装 vtable）
+    inline uint64_t voice_send_inner_vtbl = 0x8DD0028;// 数据目标（内层 vtable，类型判别）
+    inline uint64_t voice_send_inner_dtor = 0x619B7C0;// 数据目标（内层 vtable[0]，预检用）
+    inline uint64_t voice_send_outer_slot0 = 0xA7F0;  // 数据目标（外层 vtable[0]，预检用）
 }
 
 

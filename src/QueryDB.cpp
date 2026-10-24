@@ -8,6 +8,7 @@
 
 #include "QueryDB.h"
 #include "wx_send.h"
+#include "VoiceUploadProbe.h"
 
 
 using json = nlohmann::json;
@@ -179,6 +180,86 @@ void Route_QueryDB(httplib::Server& svr)
 		res.set_content(WeixinSend::StructCheckReportJson(), "application/json");
 		});
 
+	// ── VOICE-DUMP 只读埋点：开关 + 状态 + 最近一次 dump 全文 ──────────
+	//   GET  /Debug/VoiceDump                → 查状态
+	//   POST /Debug/VoiceDump {"on":true}    → 运行时开（{"on":false} 关）
+	//   POST /Debug/VoiceDump {"dump":true}  → 立刻再 dump 一次最近捕获的对象
+	// 只读诊断：不发消息、不改对象、不改任何既有行为。
+	svr.Get("/Debug/VoiceDump", [](const httplib::Request&, httplib::Response& res) {
+		res.set_content(WeixinSend::VoiceDumpReportJson(), "application/json");
+		});
+	svr.Post("/Debug/VoiceDump", [](const httplib::Request& req, httplib::Response& res) {
+		bool on = false, hasOn = false, dumpNow = false;
+		try {
+			if (!req.body.empty()) {
+				json r = json::parse(req.body);
+				if (r.contains("on") && r["on"].is_boolean()) { on = r["on"].get<bool>(); hasOn = true; }
+				if (r.contains("dump") && r["dump"].is_boolean()) dumpNow = r["dump"].get<bool>();
+			}
+		} catch (...) {
+			// body 不是合法 JSON：不当错误，退化成"只查状态"
+		}
+		if (hasOn) WeixinSend::VoiceDumpSetEnabled(on);
+		if (dumpNow) WeixinSend::VoiceDumpNow();
+		res.set_content(WeixinSend::VoiceDumpReportJson(), "application/json");
+		});
+
+	// ── VUPROBE 只读埋点：语音"上传"链路（CDN 上传入口 / uploadvoice CGI /
+	//    语音消息工厂）。默认关；只读 dump，不发消息、不改对象、不改行为。
+	//   GET  /Debug/VuProbe               → 查状态
+	//   POST /Debug/VuProbe {"on":true}   → 运行时开（{"on":false} 关）
+	svr.Get("/Debug/VuProbe", [](const httplib::Request&, httplib::Response& res) {
+		res.set_content(VuProbe::ReportJson(), "application/json");
+		});
+	svr.Post("/Debug/VuProbe", [](const httplib::Request& req, httplib::Response& res) {
+		bool on = false, hasOn = false;
+		try {
+			if (!req.body.empty()) {
+				json r = json::parse(req.body);
+				if (r.contains("on") && r["on"].is_boolean()) { on = r["on"].get<bool>(); hasOn = true; }
+			}
+		} catch (...) {
+			// body 不是合法 JSON：退化成"只查状态"
+		}
+		if (hasOn) VuProbe::SetEnabled(on);
+		res.set_content(VuProbe::ReportJson(), "application/json");
+		});
+
+    // ── DB-RESCAN 诊断路由：句柄注册表快照 / 触发一次取名扫描 ──────────────
+    //   GET  /Debug/DBRescan                → **纯只读**快照（库名、句柄、连续失败次数、
+    //                                          最后一次成功多久以前、扫描次数/上次扫描时间）
+    //   POST /Debug/DBRescan {"force":true} → 触发一次取名扫描（**带 30 秒节流**；
+    //                                          节流窗口内返回"太快了"而不是硬扫）
+    // 用途：修掉"数据库句柄丢失"缺陷后（见 xdb/db_mgr.cpp 顶部 db_registry 说明），
+    //       这是现场诊断入口 —— 桥报 "get database handle ... failed" 时先看这里。
+    // 红线：不发消息、不改库、不主动探测句柄（不发 SELECT 1、不用 SEH）。
+    // ── API 表诊断：谁是 null / 谁不在模块内 / 钩子装了没 ──────────
+    //   用途：区分「钩子没装上」和「钩子装了但入口不对」。
+    //   典型现场：registry 里 prepare 抓到的句柄 db 名为空 → 查 db_filename 槽位。
+    svr.Get("/Debug/ApiTable", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(xmgr::DatabaseMgr::getInstance().apiTableReport().dump(2, ' ', false),
+                        "application/json");
+        });
+
+    svr.Get("/Debug/DBRescan", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(xmgr::DatabaseMgr::getInstance().dbRescanReport().dump(2, ' ', false),
+                        "application/json");
+        });
+    svr.Post("/Debug/DBRescan", [](const httplib::Request& req, httplib::Response& res) {
+        bool force = false;
+        try {
+            if (!req.body.empty()) {
+                json r = json::parse(req.body);
+                if (r.contains("force") && r["force"].is_boolean()) force = r["force"].get<bool>();
+            }
+        } catch (...) {
+            // body 不是合法 JSON：退化成"只查状态"
+        }
+        xmgr::DatabaseMgr& mgr = xmgr::DatabaseMgr::getInstance();
+        res.set_content((force ? mgr.dbRescanForce() : mgr.dbRescanReport()).dump(2, ' ', false),
+                        "application/json");
+        });
+
     svr.Get("/QueryDB/debug", [](const httplib::Request&, httplib::Response& res) {
         json j;
         const size_t base = (size_t)g_hWeixinDll;
@@ -204,46 +285,22 @@ void Route_QueryDB(httplib::Server& svr)
         j["vfs_addr"] = (uint64_t)vfsAddr;
         j["vfs_value"] = IsBadReadPtr((LPVOID)vfsAddr, sizeof(void*)) ? 0 : (uint64_t)*(void**)vfsAddr;
 
-        // ③ 实跑一遍扫描，看命中多少候选
-        j["scan_hits"] = SafeScanHits(base);
-
-        // ③b 逐个候选查详情：是假命中，还是真句柄但取不到数据库名
+        // ③ 注册表概况（**不再跑地址空间扫描、不再对候选句柄 prepare 试探**）
+        //    原来的 ③/③b 每次调用都做两遍全地址空间扫描 + 对候选句柄 prepare 探测：
+        //    · 又慢又危险（桥一催就越扫越慢、还会摸到假句柄）
+        //    · 是"客户端启动被拖到 3 分钟"的直接原因之一
+        //    现在只看注册表（prepare/open_v2 钩子的真实记录）+ 缓存，全部只读。
         {
-            json detail = json::array();
-            auto* rt = xmgr::DatabaseMgr::getInstance().getSqlite3Rountines();
-            std::vector<LPVOID> hits;
-            size_t vfsVal = base + XWECHAT_SQLITE3_VFS_OFFSET;
-            ScanPattern(GetCurrentProcess(), (BYTE*)&vfsVal, sizeof(LPVOID), hits);
-            int n = 0;
-            for (auto h : hits) {
-                if (n++ >= 8) break;
-                json d;
-                d["handle"] = (uint64_t)h;
-                const bool bad = IsBadReadPtr(h, sizeof(void*)) != 0;
-                d["bad_ptr"] = bad;
-                if (!bad && rt) {
-                    d["errcode"] = rt->errcode(h);
-                    sqlite3_stmt* stmt = nullptr;
-                    int rc = rt->prepare(h, "PRAGMA database_list", -1, &stmt, 0);
-                    d["prepare_rc"] = rc;
-                    if (rc == SQLITE_OK && stmt) {
-                        json rows = json::array();
-                        int guard = 0;
-                        while (rt->step(stmt) == SQLITE_ROW && guard++ < 20) {
-                            const unsigned char* t0 = rt->column_text(stmt, 0);
-                            const unsigned char* t1 = rt->column_text(stmt, 1);
-                            rows.push_back(std::string(t0 ? (const char*)t0 : "") + "|" + std::string(t1 ? (const char*)t1 : ""));
-                        }
-                        rt->finalize(stmt);
-                        d["rows"] = rows;
-                    }
-                }
-                detail.push_back(d);
-            }
-            j["scan_detail"] = detail;
+            xmgr::DatabaseMgr& mgr = xmgr::DatabaseMgr::getInstance();
+            json reg = json::parse(mgr.dbRescanReport().dump());
+            j["registry"] = reg["registry"];
+            j["name_pass"] = reg["name_pass"];
+            j["counters"] = reg["counters"];
+            j["hooks"] = reg["hooks"];
+            j["db_count"] = reg["db_count"];
         }
 
-        // ④ 扫描结果里的数据库
+        // ④ 句柄表（库名 → 句柄）
         j["dbs"] = xmgr::DatabaseMgr::getInstance().getDatabaseInfo();
         res.set_content(j.dump(2, ' ', false), "application/json");
         });

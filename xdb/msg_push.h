@@ -1,12 +1,17 @@
 #pragma once
 // ══════════════════════════════════════════════════════════════════════
-//  消息写入抓取 + 推送（第三轮）
+//  消息写入抓取 + 推送（第三轮 → 第三轮改造：通知式）
 //
 //  分工（保持 db_mgr.cpp 只做"识别"，本文件只做"抓取与投递"）：
-//    db_mgr.cpp  挂 SQL 入口钩子、解析 SQL、判断是不是消息写库、
-//                解析/查询列清单，然后调这里的 mark()。
-//    本文件      记录 bind 的值、成行打包 JSON、有界队列 + 单工作线程
-//                POST 到 g_CallBack_Url。
+//    db_mgr.cpp  挂 SQL 入口钩子、解析 SQL、判断是不是消息写库，然后调这里的 mark()/notifyWrite()
+//    本文件      有界队列 + 单工作线程 POST 到 g_CallBack_Url
+//
+//  ⚠️ 第三轮改造（实测结论，别退回旧路）：
+//    "标记 + bind 抓值"这条路**走不通** —— Msg_ 的 INSERT 是挂钩前就 prepare 好的**缓存语句**，
+//    标记只能在 step 时事后补、而且保持不住（实测 [PUSH-LATE] 反复出现、[PUSH-CAP] 一条都没有）
+//    → 值永远抓不到。改成**通知式**：只告诉桥"某个 Msg_ 表刚被写了"，桥收到后立刻查一次库
+//    （通知触发那一刻库必然是开着的 —— 这才是真正根治"聋窗"的点）。完全绕开语句缓存问题。
+//    mark()/bindValue()/rowDone() 保留（**不再依赖**它们；[PUSH-CAP] 那类行诊断日志还有用）。
 //
 //  设计约束（对应任务书红线 4「hook 里绝不阻塞」）：
 //    * 微信线程上**绝不做网络 I/O**：只做内存拷贝 + 入队（有界，满了丢最旧并计数）。
@@ -32,8 +37,16 @@ namespace msgpush {
 
     // prepare 时机：把这条 INSERT/REPLACE 标进表
     //   pushable = 是否是"要推给桥"的行（表名 Msg_*）
+    //   注意：**通知式推送不依赖这个标记**（标记保持不住，见文件头说明）；保留仅为行诊断。
     void mark(sqlite3_stmt* stmt, const std::string& db, const std::string& table,
               const std::vector<std::string>& cols, bool pushable);
+
+    // ── 通知式推送（第三轮改造的主路）────────────────────────────────
+    // 只入队一条**轻量通知**：{"t":"msg","db":"…","table":"Msg_…","ts":<ms>}（不带任何列/值）。
+    // 桥收到后立刻针对该表对应的会话查一次库 —— 那一刻库必然是开着的（微信刚写完）。
+    // 同表 500ms 内只发一次（一次消息写入常伴随多条语句，防刷屏）。
+    // 纯内存操作 + 短临界区：微信线程上零网络、零阻塞。
+    void notifyWrite(const std::string& db, const std::string& table);
 
     // bind 时机：只处理已标记的 stmt；data/nbytes 仅对 TEXT/BLOB 有效
     void bindValue(sqlite3_stmt* stmt, int idx, int type,

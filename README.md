@@ -1,314 +1,117 @@
-# WeChat-Hook
- 
-Windows 微信 Hook DLL，当前版本以 `version.dll` 代理方式加载，在微信主进程中启动本地 HTTP 服务，提供消息发送、XML 转发、图片解码、个人资料读取和数据库查询接口。
+# 微信 Hook（WeChat 4.1.10.27 x64）
 
-微信控制器： 
-https://github.com/aixed/wechat_control
+> ⚠️ **仅供个人学习研究**。修改/挂钩微信客户端可能违反腾讯用户协议，账号有被封禁的风险。
+> 请勿用于商业用途、骚扰他人或任何违法场景。使用即表示你自行承担全部后果。
 
-### Hook 3.9.10.16 接口文档 
-- E语言版 https://www.showdoc.com.cn/WeChatProject/8929480485871668
-- C++版 https://www.showdoc.com.cn/wechatHook391016/11559060627222816
+这是一个 **`version.dll` 代理型微信 Hook**，衍生自 [aixed/WeChat-Hook](https://github.com/aixed/WeChat-Hook)（**上游无 LICENSE**，版权归原作者）。
+我们在其基础上做了大量修改，并整理成可维护的工程结构，供学习 Windows 逆向 / Hook / 微信本地数据结构使用。
 
-### Hook 4.1.10.27 接口文档
-- https://www.showdoc.com.cn/PCWeixinHook/11559060626558382
+## 它做了什么
 
-### go 协议版 3.9.10.16
-- https://www.showdoc.com.cn/go391016/11559060627219544
+把 `version.dll` 放进微信客户端目录后，微信启动时会加载它。它提供：
 
-### c++ 协议版 3.9.10.16
-- https://www.showdoc.com.cn/vx391016protocol/11559060626578602
+| 能力 | 说明 |
+|---|---|
+| **本地 HTTP 服务**（127.0.0.1:30001）| 读微信数据库、发消息、诊断 |
+| **数据库查询** | `/QueryDB/execute`、`/QueryDB/status`、`/QueryDB/GetAllDBName` |
+| **发消息** | `/SendTextMsg`（支持真 @）、`/SendImgMsg`、`/SendVoiceMsg`（真语音气泡，type 34）|
+| **图片解密** | `/Decode_Pic` |
+| **消息推送** | 新消息 POST 到 `http://127.0.0.1:18998/recv`（需 `hook-push.on`）|
+| **眼睛（原图 / 整片视频）** | `VoiceUploadProbe` 探针 + CDN 重放（需 `hook-cdn-replay.on`）|
+| **诊断** | `/Debug/ApiTable`、`/Debug/DBRescan`、`/Debug/VuProbe`、`/Debug/VoiceDump` |
 
-## 交流群
-- https://t.me/WeChat_Hook
+## 构建
 
-## QQ 364831018
+前置：
 
-## 版本说明
-
-- 目标微信版本：`4.1.10.27`
-- 架构：Windows x64
-- DLL 名称：`version.dll`
-- 默认监听地址：`0.0.0.0:30001`
-- 当前 main 分支已移除 VMP 保护、远程授权校验、PB/NetSceneSendPB、CDN、WcProbe/CCD/NtQuery 相关 Hook 安装与处理代码。
-
-## 使用方式
-
-1. 编译或从 Release 下载生成后的 `version.dll`。
-2. 将 `version.dll` 放到微信安装目录下，我这里是：
-
-```text
-C:\Program Files\Tencent\Weixin
-```
-
-3. 启动微信。DLL 加载后会自动启动 HTTP 服务，默认端口是 `30001`。
-4. 使用 Postman 或其他 HTTP 客户端调用接口，默认基地址：
-
-```text
-http://127.0.0.1:30001
-```
-
-5. Postman 可直接导入接口集合：
-
-```text
-postman/WeChat-Hook.postman_collection.json
-```
-
-## 项目结构
-
-- `dllmain.cpp`：DLL 入口，解析启动参数，加载真实系统 `version.dll`，只在微信主进程初始化。
-- `src/version_proxy.cpp`：代理系统 `version.dll` 导出函数。
-- `src/inline_weixin_dll_load.cpp`：等待并初始化 `Weixin.dll` 相关逻辑，启动 HTTP 服务。
-- `src/http_routes.cpp`：HTTP 路由注册入口。
-- `src/SendTextMsg.cpp`：文本发送和图片解码接口。
-- `src/SendImageMsg.cpp`：图片发送接口。
-- `src/ForwardXMLMsg.cpp`：XML 消息转发接口。
-- `src/GetSelfProfile.cpp`：当前账号资料接口。
-- `src/QueryDB.cpp`、`xdb/`：微信进程内 SQLite 数据库查询接口。
-
-## 编译
-
-使用 Visual Studio / MSBuild 编译：
+- Windows 10 / 11 x64
+- Visual Studio 2022 **Build Tools**（勾选「使用 C++ 的桌面开发」）
+- 子模块（MinHook 等）
 
 ```powershell
-MSBuild.exe x64_Version_dll.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=x64
+git clone https://github.com/mengyunqwq/wechat-hook.git
+cd wechat-hook
+git submodule update --init --recursive
+
+pwsh -File scripts/build.ps1
 ```
 
-Release 输出：
+产物：`x64\Release\version.dll`（约 776KB）
 
-```text
-x64\Release\version.dll
+手动编译：
+
+```powershell
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+& $msbuild x64_Version_dll.sln /p:Configuration=Release /p:Platform=x64 /m
 ```
 
-Debug 输出：
+## 部署
 
-```text
-x64\Debug\version.dll
+1. **完全退出微信**（任务管理器里 `Weixin.exe` 进程数为 0）
+2. 把 `version.dll` 放进 `Weixin.exe` 同目录
+3. 带参数启动：
+
+```powershell
+Start-Process 'D:\wxhook\wx4110\Weixin.exe' `
+  -ArgumentList 'StartPort=30001','RecvType=1','CallBackURL=http://127.0.0.1:18998/recv' `
+  -WorkingDirectory 'D:\wxhook\wx4110'
 ```
 
-## 加载与启动参数
+4. 验证：
 
-项目生成的 DLL 文件名为 `version.dll`。加载后会代理系统 `version.dll` 的导出函数，并在微信主进程内初始化 Hook 与 HTTP 服务。
-
-支持的命令行参数：
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `StartPort=` | `30001` | HTTP 服务监听端口 |
-| `RecvType=` | `1` | 接收回调类型参数，当前保留解析 |
-| `CallBackURL=` | 空 | 接收回调地址，当前用于保存配置和端口解析 |
-
-示例：
-
-```text
-WeChat.exe StartPort=30001 CallBackURL="http://127.0.0.1:8080/callback"
+```powershell
+Invoke-RestMethod http://127.0.0.1:30001/QueryDB/status
+# 期望：{"IsLogin":1,"hWeixin":...}
 ```
 
-## HTTP 接口
+> ⚠️ 登录后**点一次微信左侧「通讯录」**：`contact.db` 只在打开通讯录/搜索联系人时才打开，
+> 不点的话查 contact.db 会失败（群成员/昵称/@ 都会退化）。
 
-所有接口默认基地址：
+## 目录结构
 
-```text
-http://127.0.0.1:30001
+```
+include/              头文件
+  global.h            全局变量 + 部分偏移常量
+  offset_patterns.h   偏移特征码（自动生成，跨版本自适应）
+  wx_send.h           发送实现声明
+  SendVoiceMsg.h      语音发送
+  VoiceUploadProbe.h  眼睛探针
+src/
+  QueryDB.cpp         数据库查询路由
+  SendTextMsg.cpp     文本发送
+  SendImageMsg.cpp    图片发送
+  SendVoiceMsg.cpp    语音发送（真气泡）
+  VoiceUploadProbe.cpp 眼睛探针（CDN 重放）
+  wx_send.cpp         发送实现（结构体构造 + 调用客户端）
+  http_routes.cpp     路由注册
+  offset_resolver.cpp 运行时偏移解析（特征码扫描 + 兜底）
+xdb/
+  db_mgr.cpp          数据库句柄捕获（open/open16/open_v2/prepare）+ late-arm
+  msg_push.cpp        新消息推送
+docs/
+  reverse-notes.md    逆向分析笔记（结构、端点、Hook 目标、崩溃分析）
+scripts/build.ps1     构建脚本
+VERSION               版本号
+CHANGELOG.md          变更记录
 ```
 
-### 发送文本消息
+## 已知问题
 
-`POST /SendTextMsg`
+- **数据库并发（重要）**：Hook 通过 `sqlite3_api_routines` 函数表调用 `prepare/step`，
+  **绕过了 sqlite 的连接互斥锁**。与客户端自身查询并发时可能踩坏 sqlite lookaside 空闲链表，
+  导致客户端在 `Weixin.dll+0x32BB50C`（lookaside 分配）崩溃。
+  当前用全局 `recursive_mutex` 串行化 Hook 自身调用，但无法覆盖客户端线程。
+  详见 [docs/reverse-notes.md](docs/reverse-notes.md)。
+- 偏移与 **4.1.10.27 x64** 绑定；微信升级后需按 `docs/reverse-notes.md` 更新 `offset_patterns.h`。
 
-请求：
+## 免责声明
 
-```json
-{
-  "wxidorgid": "wxid_xxx",
-  "msg": "hello"
-}
-```
+- 上游 [aixed/WeChat-Hook](https://github.com/aixed/WeChat-Hook) **没有 LICENSE 文件**，按著作权法默认「保留所有权利」。
+  本项目是衍生作品，**不授予任何再分发许可**；仅供学习，请勿商用或再分发。
+- 本项目不含任何微信账号、密钥或聊天数据。
+- 使用风险（封号、数据损坏、法律风险）由使用者自行承担。
 
-响应：
+## 相关项目
 
-```json
-{
-  "ret": 0,
-  "retmsg": "success"
-}
-```
-
-curl：
-
-```bash
-curl -X POST http://127.0.0.1:30001/SendTextMsg \
-  -H "Content-Type: application/json" \
-  -d "{\"wxidorgid\":\"wxid_xxx\",\"msg\":\"hello\"}"
-```
-
-### 发送图片消息
-
-`POST /SendImgMsg`
-
-请求：
-
-```json
-{
-  "wxidorgid": "wxid_xxx",
-  "path": "C:\\path\\image.jpg"
-}
-```
-
-响应：
-
-```json
-{
-  "ret": 0,
-  "retmsg": "success"
-}
-```
-
-### 转发 XML 消息
-
-`POST /ForwardXMLMsg`
-
-请求：
-
-```json
-{
-  "to_wxid": "wxid_xxx",
-  "content": "<msg>...</msg>"
-}
-```
-
-响应：
-
-```json
-{
-  "ret": 0,
-  "retmsg": "success"
-}
-```
-
-失败时：
-
-```json
-{
-  "ret": 1,
-  "retmsg": "fail"
-}
-```
-
-### 解码图片
-
-`POST /Decode_Pic`
-
-请求：
-
-```json
-{
-  "src_path": "C:\\path\\source.dat",
-  "dst_path": "C:\\path\\output.jpg"
-}
-```
-
-响应：
-
-```json
-{
-  "ret": 0,
-  "retmsg": "success"
-}
-```
-
-### 获取当前账号资料
-
-`POST /GetSelfProfile`
-
-请求体可为空。
-
-响应字段：
-
-```json
-{
-  "wxid": "",
-  "alias": "",
-  "nickname": "",
-  "email": "",
-  "qq": 0,
-  "phone": "",
-  "proiv": "",
-  "area": "",
-  "signinfo": ""
-}
-```
-
-### 查询数据库
-
-`POST /QueryDB/execute`
-
-请求：
-
-```json
-{
-  "optDbName": "MicroMsg.db",
-  "SQL": "SELECT * FROM ChatRoom LIMIT 10"
-}
-```
-
-响应：
-
-```json
-{
-  "status": 0,
-  "desc": "",
-  "data": []
-}
-```
-
-### 获取数据库列表
-
-`POST /QueryDB/GetAllDBName`
-
-请求体需要是合法 JSON，可传空对象：
-
-```json
-{}
-```
-
-响应：
-
-```json
-[
-  {
-    "dbName": "MicroMsg.db",
-    "dbHandle": 123456789
-  }
-]
-```
-
-### 查询运行状态
-
-`GET /QueryDB/status`
-
-响应：
-
-```json
-{
-  "IsLogin": 1,
-  "hWeixin": 123456789
-}
-```
-
-## 返回约定
-
-- JSON 解析失败时，接口返回：
-
-```json
-{
-  "ret": -1,
-  "msg": "invalid json"
-}
-```
-
-- 数据库接口使用 `status` / `desc` / `data` 作为返回字段。
-- 消息发送类接口使用 `ret` / `retmsg` 作为返回字段。
-
-## 备注
-
-本项目依赖微信内部偏移，微信升级后需要重新核对偏移和调用约定。当前 README 与 Release DLL 对应微信 `4.1.10.27`。
+- [mengyunqwq/wechat-bot](https://github.com/mengyunqwq/wechat-bot) —— 基于本 Hook 的微信机器人（接入层 / 拟人策略 / 控制面板）
