@@ -917,3 +917,58 @@ step hook（客户端线程）
 1. 枚举更多库，找到 message 库（表名可能含 msg/chat）
 2. 对 message 库执行 `SELECT * FROM <表名> ORDER BY rowid DESC LIMIT 10`
 3. 把结果通过 HTTP 暴露
+## 🎉🎉🎉 新版读到了真实消息数据（2026-10-24 21:10）
+
+### 完整成功
+
+`wxdump21.cpp` 在新版 4.1.15.56 上：
+1. 枚举各库的表
+2. 识别出 `Msg_xxx` 表（消息库）
+3. 执行 `SELECT * FROM Msg_xxx ORDER BY rowid DESC LIMIT 3`
+4. 用 `column_text(#42)` 读出每一列
+
+### 真实消息数据（实测输出）
+
+```
+*** MESSAGE DB FOUND: Msg_9e20f478899dc29eb19741386f9343c8 ***
+MSG row 1:
+   [0] 106
+   [1] 2424952228019969912      ← msgSvrId
+   [2] 1                        ← type
+   [3] 1792829557000            ← createTime(ms)
+   [4] 2
+   [5] 1792829557               ← createTime(s)
+   [6] 2
+   [7] 0
+   [8] 0
+   [9] 0
+   [10] 1
+   [11] <msgsource><alnode><fr>1</fr></alnode></msgsource>
+```
+
+**这是微信真实的消息记录**（旧版也是同样的字段布局）。
+
+### 新版读库能力清单（全部打通）
+
+```
+✅ 注入（ilink 代理 + 延迟 core）
+✅ HTTP（30001）
+✅ 登录
+✅ 枚举数据库（各库表结构）
+✅ 识别消息库（Msg_* 表）
+✅ 读取消息行（字段：localId/msgSvrId/type/createTime/msgsource...）
+```
+
+### 核心突破点回顾
+
+1. `step` hook（手动 trampoline，函数头只有 push/sub，安全）
+2. `stmt->db` 偏移 0
+3. **`column_text` 槽位是 #42**（不是 #36，存在 +6 偏移）
+4. 查询走 trampoline（不递归）
+5. 全部在客户端线程
+
+### 下一步
+
+1. 读更多列（content 文本可能在 #13+）
+2. 把查询封装成 HTTP 接口（/QueryDB）
+3. 消息轮询 → 机器人收消息
