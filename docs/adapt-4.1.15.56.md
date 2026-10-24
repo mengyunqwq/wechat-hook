@@ -389,3 +389,40 @@ x64dbg 已装：`E:\tools\x64dbg\release\x64\x64dbg.exe`
 ### 当前状态
 
 机器人已恢复 4.1.10.27（5 进程、登录、30 表、查询正常）。
+## 栈扫描探针（2026-10-24 15:10）
+
+`wxdump3.cpp`（103KB）→ 部署为 `wxdump.dll`
+- patch `ws2_32!send` 后，第一次调用时扫描整个栈（rsp ~ rsp+256KB）
+- 用 SEH 保护的 `scan_range()` 挑出所有落在 `Weixin.dll` 范围内的 qword
+- 输出 `WX+0x...` 列表
+
+### 抓到 512 帧、13 个唯一地址
+
+```
+0x76C9F47  (call 0x754BEA0 = __security_check_cookie)
+0x76CB501
+0x76CB6DA  (call 0x76CBB48)
+0x76CB97E  (call 0x76D0FA8)
+0x76CBF2B  (call 0x754BEA0)
+0x76CC200
+0x7707A9F  (call 0x7708424)
+0x7708BB1  (call 0x771005C)
+0x901247D / 0x90124A6 / 0x9E552C0 / 0x9E6F4D6 / 0xBB8F940（非 call 返回，可能是数据/过期帧）
+```
+
+### 重要判断
+
+发送线程的栈里**没有业务层**（构造消息对象那层）。原因：
+- 发送是**异步**的（业务线程把消息放进队列，网络线程负责 send）
+- 所以我们 hook `send` 只能看到网络线程的栈
+
+### 下一步（要抓业务层，需要换断点位置）
+
+1. **在主线程/UI 线程上探针**：hook `PostMessage`/`DispatchMessage` 或消息循环，发消息时记录栈
+2. **hook 消息队列投递**：微信异步发送一般走 task 队列（`0x76CB6DA` 那条链可能就是队列 worker）
+3. **hook 数据库写入**：发消息前通常会写 `message_*.db`，hook sqlite 的 `prepare`（表地址已知）能拿到业务层调用栈
+4. 或者：**hook 已知的 0x4E7CD4F 虚调用目标**（vtable），看谁调它
+
+### 当前状态
+
+机器人已恢复 4.1.10.27（5 进程、登录、30 表、查询正常）。
