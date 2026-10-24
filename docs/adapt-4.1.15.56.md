@@ -2943,3 +2943,56 @@ content:   +0x768 (inline_buf) +0x778 (length) +0x780 (cap)
 - `wxdump46.cpp`（借道版，已验证）
 - `minhook/`（MinHook 源码）
 - 探针部署：`D:\wxhook\wx4156\4.1.15.56\wxdump.dll`
+## 🎉 整合版（读库+发消息）成功！2026-10-25 18:40
+
+### wxdump51（整合版）
+
+```
+✅ step hook（手写 trampoline）→ 读库
+✅ zstd 解压 → 完整 XML
+✅ HTTP 30006（/status /messages）
+✅ 发消息 hook（MinHook，就绪，需触发）
+```
+
+### 实测
+
+```
+/status:  {"status":0,"msgdb":"Msg_9e20...","hasDb":1}
+/messages: 2890 字节，5 条消息
+content: <?xml version="1.0"?><mmreader><category type="20"...<name><![CDATA[腾讯新闻
+→ zstd 解压成功
+```
+
+### 架构（最终）
+
+```
+step hook      = 手写 trampoline（MinHook 对 step 无效！）
+send_message   = MinHook（手写 trampoline 会崩）
+zstd           = 集成（decompress）
+HTTP           = 30006（/status /messages）
+```
+
+### 发消息
+
+```
+send.txt (target|text) + 触发（PostMessage 或用户发一条）
+→ MinHook 改写 → 微信发出
+```
+
+**注意**：PostMessage 触发不稳定（坐标/焦点），用户手动发一条最可靠。
+
+### 与旧版功能对齐
+
+| 功能 | 新版状态 |
+|---|---|
+| 读库（QueryDB）| ✅ /messages |
+| 发消息（SendText）| ✅ 借道（需触发）|
+| 收消息 | ✅ 读库轮询可做 |
+| 联系人/群成员 | ✅ 读库 |
+| 图片/语音/文件 | 🟡 待逆向 |
+
+### 文件
+
+- `wxdump51.cpp`（整合版，读库+发消息）
+- `minhook/`（MinHook 源码）
+- zstd（E:\tools\zstd-1.5.7）
