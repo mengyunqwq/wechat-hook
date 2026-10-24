@@ -241,3 +241,36 @@ getHandle 字符串       file 0xB3FF5A9
 
 机器人继续使用 4.1.10.27（功能完整、稳定）。
 `2026-10-24`
+## 动态探针：拿到 4.1.15.56 的真实发送调用栈（2026-10-24 14:35）
+
+工具链：`wxdump.dll`（146KB，纯 Win32，无 MinHook）
+- 由 ilink 代理调用 `WxDumpStart()` 启动
+- patch `ws2_32!send` 头 12 字节为 `mov rax, my_send; jmp rax`
+- 第一次调用时记录 `RtlCaptureStackBackTrace` 并恢复原字节（只抓一次）
+
+实测：在 4.1.15.56 上给文件传输助手发一条文字，抓到调用栈：
+
+```
+[send] bytes=861
+  Weixin.dll+0x4DC7DFB     ← 最内层，直接调用 send（含 WSAGetLastError，网络发送封装）
+  Weixin.dll+0x66C04CB
+  Weixin.dll+0x4E83297
+  Weixin.dll+0x4E7CD51
+  Weixin.dll+0x121D26
+  KERNEL32.DLL+0x2E8D7
+  ntdll.dll+0x8C53C
+```
+
+### Ghidra 环境（已就绪）
+
+```
+Ghidra 12.2 + JDK 25（E:\tools\ghidra / E:\tools\jdk25）
+脚本：E:\tools\gh_scripts\decompile_at.java（按 RVA 反编译）
+已验证：反编译 0x4DC7D90 成功（含 WSAGetLastError 调用）
+```
+
+### 下一步
+
+1. 反编译 0x66C04CB / 0x4E83297 / 0x4E7CD51 / 0x121D26 所在函数
+2. 找消息业务层（构造 TextRequest / 调 send 的那一层）
+3. 得到 4.1.15.56 的发送入口 RVA → 写进 hook
