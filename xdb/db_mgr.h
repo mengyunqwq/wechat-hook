@@ -8,6 +8,7 @@
 namespace xmgr {
     // 尽早触发 DatabaseMgr 构造（起线程 + 延迟；DLL 加载时调用一次）
     void StartEarlyInitThread();
+    void StartEarlyArmThread();   // 登录前就装钩子（open16/prepare）
     class DatabaseMgr
     {
     public:

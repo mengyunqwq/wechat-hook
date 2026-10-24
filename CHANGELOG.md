@@ -1,5 +1,27 @@
 # 变更记录
 
+## 1.1.0（2026-10-24）
+
+### 修复：客户端在 `Weixin.dll+0x32BB50C` 崩溃（sqlite lookaside 损坏）
+- 根因：Hook 走 `sqlite3_api_routines` 函数表调 `prepare/step`，**绕过了 sqlite 的连接互斥锁**；
+  与客户端线程并发时会踩坏 lookaside 空闲链表。
+- 修复：新增 `SqliteConnLock`，查库/备份前后用 `api->db_mutex / mutex_enter / mutex_leave`
+  拿同一把连接锁（recursive，重入安全）。
+
+### 修复：登录前就装数据库钩子（早装）
+- 客户端秒登录时，DB 在 Hook 装 open16/prepare 之前就打开了，句柄登记不上 → 查库全失败。
+- 新增 `xmgr::StartEarlyArmThread()`：DLL 加载后轮询 API 表，一填好就装钩子（幂等）。
+- 安装入口（install/installCode/installPrepare/rearm）加 `recursive_mutex`，避免早装线程与
+  首次 HTTP 查询并发重复挂钩。
+
+### 其它
+- `/QueryDB/execute` 成功拿到库句柄时置 `g_IsLogin=1`（桥不再误判未登录）
+- `backup()` 也套同一把连接锁
+
+### 验证
+- 冷启动：首次查询前 `registry=36 / named=30`，contact/session/message 三库立即只读
+- 查询 1~10ms，无死锁；发送 ret=0
+
 ## 1.0.0（2026-10-24）
 
 首个公开整理版本。相对上游 aixed/WeChat-Hook 的主要改动：

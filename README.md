@@ -98,11 +98,10 @@ CHANGELOG.md          变更记录
 
 ## 已知问题
 
-- **数据库并发（重要）**：Hook 通过 `sqlite3_api_routines` 函数表调用 `prepare/step`，
-  **绕过了 sqlite 的连接互斥锁**。与客户端自身查询并发时可能踩坏 sqlite lookaside 空闲链表，
-  导致客户端在 `Weixin.dll+0x32BB50C`（lookaside 分配）崩溃。
-  当前用全局 `recursive_mutex` 串行化 Hook 自身调用，但无法覆盖客户端线程。
-  详见 [docs/reverse-notes.md](docs/reverse-notes.md)。
+- **数据库并发（1.1.0 已修）**：此前 Hook 通过 `sqlite3_api_routines` 函数表调用 `prepare/step`，
+  **绕过了 sqlite 的连接互斥锁**，与客户端线程并发时会踩坏 lookaside 空闲链表
+  （崩溃点 `Weixin.dll+0x32BB50C`）。1.1.0 起用 `SqliteConnLock` 拿 sqlite 自己的连接锁，
+  并加安装互斥、登录前早装。详见 [docs/reverse-notes.md](docs/reverse-notes.md) 第五节。
 - 偏移与 **4.1.10.27 x64** 绑定；微信升级后需按 `docs/reverse-notes.md` 更新 `offset_patterns.h`。
 
 ## 免责声明

@@ -1,5 +1,6 @@
 #include "db_mgr.h"
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <set>
 #include <string>
@@ -48,6 +49,33 @@ namespace db_registry {
     // sqlite3 API 表（installPrepare 里填入）。这里提前声明：取名/复核会用到它的只读槽位
     // db_filename（**只读、不发 SQL**）。
     sqlite3_api_routines* g_api = nullptr;
+    // 安装钩子的互斥：早装线程 / DatabaseMgr 构造 / HTTP 线程可能同时进来
+    std::recursive_mutex g_installMtx;
+
+// ── 连接级互斥（对齐 sqlite 自己的连接锁）────────────────────────
+// 背景：我们通过 sqlite3_api_routines 直接调 prepare/step/finalize，
+//       这些是内部实现，**不拿连接锁**（公开 sqlite3_prepare_v2 才会 enter）。
+//       与客户端线程并发时会踩坏 lookaside 空闲链表 → 客户端崩溃。
+//       这里借 api 表的 db_mutex / mutex_enter / mutex_leave 补上同一把锁。
+class SqliteConnLock {
+public:
+    explicit SqliteConnLock(sqlite3* db) {
+        if (g_api && g_api->db_mutex && g_api->mutex_enter && db) {
+            m_mutex = g_api->db_mutex(db);
+            if (m_mutex) {
+                g_api->mutex_enter(m_mutex);
+                m_locked = true;
+            }
+        }
+    }
+    ~SqliteConnLock() {
+        if (m_locked && g_api && g_api->mutex_leave) g_api->mutex_leave(m_mutex);
+    }
+    bool locked() const { return m_locked; }
+private:
+    sqlite3_mutex* m_mutex = nullptr;
+    bool m_locked = false;
+};
 
     // ── 计数器（热路径上只有一次 relaxed 自增/store）──────────────────
     std::atomic<long long> g_registrations{ 0 };    // 累计登记（含覆盖登记）
@@ -1559,6 +1587,7 @@ namespace db_registry {
     }
 
     void installPrepare(sqlite3_api_routines* api) {
+        std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
         if (g_installedPrepare || api == nullptr || api->prepare == nullptr) return;
         g_installedPrepare = true;
         g_api = api;
@@ -1608,6 +1637,7 @@ namespace db_registry {
     //       所以改表没用。但 api->open_v2 本身就是"真实函数的地址"，
     //       直接 hook 这段代码即可。用 MinHook（自带指令边界处理，不会把指令截断）。
     void installCode(sqlite3_api_routines* api) {
+        std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
         if (g_installedCode || api == nullptr || api->open_v2 == nullptr) return;
         g_installedCode = true;
         MH_STATUS st = MH_Initialize();
@@ -1653,6 +1683,7 @@ namespace db_registry {
     //   导致 contact.db（只在点通讯录时才打开）永远登记不上。
     //   现在每次真实查询前补装一次（幂等，挂上就不再重复）。
     void rearm(sqlite3_api_routines* api) {
+        std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
         if (api == nullptr) return;
         if (!g_installedOpen16 && api->open16 != nullptr) {
             if (installOneHook((void*)api->open16, (LPVOID)&detourOpen16, (LPVOID*)&g_origOpen16, "open16(late)")) {
@@ -1672,6 +1703,7 @@ namespace db_registry {
 
     // 安装：把 API 表里的 open_v2 指向 detour（表在 .rdata，需要临时改页保护）
     void install(sqlite3_api_routines* api) {
+        std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
         if (g_installed || api == nullptr || api->open_v2 == nullptr) return;
         g_installed = true;
         g_origOpenV2 = (open_v2_t)api->open_v2;
@@ -1695,6 +1727,31 @@ namespace db_registry {
     // 现在注册表只剩一个来源（g_slot 原子表），失效判定统一由 noteQueryResult 负责。
 }
 
+
+namespace xmgr {
+    // 早装（登录前就挂好 open16/prepare）——解决"客户端秒登录，DB 在我们装钩子之前就打开了"。
+    // 由 inline_weixin_dll_load 在 ResolveOffsets() 之后调用一次；幂等，装好后线程退出。
+    void StartEarlyArmThread() {
+        std::thread([] {
+            OutputDebugStringA("[db_registry] 早装线程启动（等待 API 表填充）\n");
+            for (int i = 0; i < 1200; ++i) {          // 最多等 10 分钟
+                if (g_hWeixinDll != nullptr) {
+                    auto* api = (sqlite3_api_routines*)((size_t)g_hWeixinDll + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
+                    if (api != nullptr && api->open16 != nullptr && api->prepare != nullptr && api->step != nullptr) {
+                        db_registry::install(api);
+                        db_registry::installCode(api);
+                        db_registry::installPrepare(api);
+                        db_registry::rearm(api);
+                        OutputDebugStringA("[db_registry] 早装完成（登录前已挂 open16/prepare）\n");
+                        return;
+                    }
+                }
+                Sleep(500);
+            }
+            OutputDebugStringA("[db_registry] 早装超时（API 表始终没填充）\n");
+        }).detach();
+    }
+}
 
 static void codec_get_key(sqlite3CodecGetKey func, sqlite3* db, int index, void** pKey, int* pLen) {
 	__try {
@@ -1766,6 +1823,7 @@ namespace xmgr {
 	nlohmann::ordered_json DatabaseMgr::execute(sqlite3* db, const std::string& sql)
 	{
         std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：避免 httplib 两个工作线程同时进客户端 sqlite
+        db_registry::SqliteConnLock _conn(db);   // ★ 连接锁：与客户端线程互斥（根治 lookaside 损坏）
         db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
 		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		if (db == nullptr) {
@@ -1865,6 +1923,7 @@ namespace xmgr {
 			return rdata;
 		}
 		s_handleFailStreak.store(0, std::memory_order_relaxed);   // 成功 → 清零
+		g_IsLogin = 1;   // 能拿到库句柄 = 已登录（桥靠这个判断）
 		rdata = execute((sqlite3*)dbHandle, sql);
 		return rdata;
 	}
@@ -1901,6 +1960,8 @@ namespace xmgr {
 
 	int DatabaseMgr::backup(sqlite3* db, const std::string& out_path)
 	{
+        std::lock_guard<std::recursive_mutex> _lck2(g_clientCallMutex);
+        db_registry::SqliteConnLock _conn(db);   // backup 与查询共用同一把连接锁
 		int rc = SQLITE_OK;
 		if (db == nullptr) {
 			return -1;

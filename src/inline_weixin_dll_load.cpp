@@ -11,6 +11,9 @@
 
 #include "global.h"
 #include "offset_resolver.h"
+
+// 前置声明（不 include db_mgr.h：那会带进 json/httplib，和 winsock 头顺序打架）
+namespace xmgr { void StartEarlyArmThread(); }
 #include <MinHook.h>
 #include "tools.h"
 #include "HookManager.h"
@@ -225,6 +228,10 @@ void Evt_WeixinLoad()
         ResolveOffsets();
         Hook_Call(WeixinDll_Offset(g_xlogHookTarget), 5, hook::MyCallHandler_xLog);
 #endif
+
+    // 数据库钩子早装（Release 也要跑）：登录前就把 open16/prepare 挂好，
+    // 否则客户端秒登录时 DB 在装钩子之前就打开了，句柄永远登记不上。
+    xmgr::StartEarlyArmThread();
     
 
     
