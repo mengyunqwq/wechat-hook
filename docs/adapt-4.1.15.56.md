@@ -197,3 +197,47 @@ getHandle 字符串       file 0xB3FF5A9
 - 机器人：4.1.10.27 正常
 - 新版：可注入 + HTTP，无 DB 能力
 - 这项已从“半天适配”变成“独立的 WCDB 逆向项目”
+## 开源项目调研与 4.1.15.13 偏移实测（2026-10-24 晚）
+
+### 找到的项目
+
+| 项目 | 许可 | 支持版本 | 价值 |
+|---|---|---|---|
+| [xueze-ai/wx-helper](https://github.com/xueze-ai/wx-helper) | MIT | **4.1.15.13** | 完整 C++ 桥接源码（text_bridge.cpp）+ MinHook + 版本指纹 |
+| [msfm2018/wxrobot](https://github.com/msfm2018/wxrobot) | — | 4.1.15.13 / 4.1.15.53 分支 | 防撤回补丁（偏移外部传入） |
+| [miloira/wxhook](https://github.com/miloira/wxhook) | 闭源 | 声称 4.1.15.56 | pip 包内 DLL 实为 3.x（WeChatWin），需完整版 |
+
+### wx-helper 给出的 4.1.15.13 偏移
+
+```
+0x54B02F0  文本消息 Builder（接收 TextRequest{SmallString receiver; SmallString body}）
+0x6F4C70   @ 工厂（MinHook hook 目标）
+0x8E53588  对象 vtable（校验用）
+消息结构：type +0x14、正文 +0x758、成员列表 +0x778、记录步长 0x78
+```
+
+### 实测：这些偏移在 4.1.15.56 上失效
+
+```
+0x54B02F0 → 变成一个「构造函数」（rcx 作输出指针、写 vtable、ret），与 Builder 语义不符
+0x8E53588 → 是 ASCII 字符串（"207C8.09…"），不是 vtable
+```
+
+### 旧版 send_message 函数特征也无法迁移
+
+```
+旧版 4.1.10.27 send_message = 0x1677A30
+取前 16/24/32 字节在新版搜索：命中 83~103 处（都是通用 prologue，定不住）
+取前 40 字节：0 命中（函数体已变）
+```
+
+### 结论
+
+- 4.1.15.13 → 4.1.15.56 之间偏移已变，不能直接搬运
+- 旧版函数字节特征在新版无法唯一定位
+- 要在 4.1.15.56 上恢复发送/读库能力，需要 **IDA/Ghidra 级逆向**（几天，且不保证成功）
+
+### 现状
+
+机器人继续使用 4.1.10.27（功能完整、稳定）。
+`2026-10-24`
