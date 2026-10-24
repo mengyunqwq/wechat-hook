@@ -274,3 +274,54 @@ Ghidra 12.2 + JDK 25（E:\tools\ghidra / E:\tools\jdk25）
 1. 反编译 0x66C04CB / 0x4E83297 / 0x4E7CD51 / 0x121D26 所在函数
 2. 找消息业务层（构造 TextRequest / 调 send 的那一层）
 3. 得到 4.1.15.56 的发送入口 RVA → 写进 hook
+## 资产清点（上下文压缩前必读）
+
+### 工具链（都装好了，可直接用）
+
+| 工具 | 路径 | 用途 |
+|---|---|---|
+| Ghidra 12.2 | `E:\tools\ghidra\ghidra_12.2_PUBLIC` | 反编译（需 JDK 25）|
+| JDK 25 | `E:\tools\jdk25\jdk-25.0.4.1+1` | Ghidra 要求 |
+| x64dbg | `E:\tools\x64dbg\release\x64\x64dbg.exe` | 动态调试（备用）|
+| Ghidra 脚本 | `E:\tools\gh_scripts\decompile_at.java` | 按 RVA 反编译 |
+| Ghidra 项目 | `E:\tools\gh_proj\wx`（/Weixin.dll 已导入，noanalysis）| |
+
+启动 Ghidra 命令模板：
+
+```
+set JAVA_HOME=E:\tools\jdk25\jdk-25.0.4.1+1
+E:\tools\ghidra\ghidra_12.2_PUBLIC\support\analyzeHeadless.bat E:\tools\gh_proj wx -process Weixin.dll -noanalysis -scriptPath E:\tools\gh_scripts -postScript decompile_at.java <RVA_HEX> <LEN_HEX>
+```
+
+### 动态探针（已验证可用）
+
+`D:\微信deepseek\data\wxdump\wxdump2.cpp` → 编译成 `wxdump.dll`（102KB）
+
+- 纯 Win32（无 MinHook、无 CRT stdio），导出 `WxDumpStart`
+- 由 ilink 代理（`D:\微信deepseek\data\proxy\proxy.cpp`）在加载时调用
+- 作用：patch `ws2_32!send`，第一次调用记录调用栈后自动恢复
+- 部署位置：`D:\wxhook\wx4156\4.1.15.56\wxdump.dll`
+- 日志：`D:\wxhook\wx4156\4.1.15.56\wxdump.log`
+
+### 已抓到的发送调用栈（4.1.15.56）
+
+```
+Weixin.dll+0x4DC7DFB   ← 直接调用 send 的网络封装（反编译确认含 WSAGetLastError）
+Weixin.dll+0x66C04CB
+Weixin.dll+0x4E83297
+Weixin.dll+0x4E7CD51
+Weixin.dll+0x121D26
+```
+
+### 关键环境问题与解法（免得重踩）
+
+```
+1. Ghidra 12.2 要求 JDK 25（不是 21）；本机 java 是 D:\ 平铺安装、缺 release 文件
+   → 已下载 JDK 25 到 E:\tools\jdk25，JAVA_HOME 指向它
+2. Ghidra 12 用 PyGhidra，headless 下 .py 脚本不可用 → 改用 .java 脚本
+3. FlatProgramAPI.disassemble 只有 (Address) 单条重载 → 用 DisassembleCommand
+4. createFunction 只有 (Address, String) 重载 → createFunction(addr, null)
+5. 先 clearListing(range) 再反汇编，避免残留 1 字节函数导致反编译为空
+6. wxdump 最初用 MinHook + CRT stdio 会导致 Weixin.exe 崩溃（0xC0000409）
+   → 改成纯 Win32 + 手写 inline patch 后稳定
+```
