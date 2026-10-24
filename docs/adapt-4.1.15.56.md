@@ -2262,3 +2262,45 @@ msgBuf+0x198 = msg_len（需要确认）
 - 完整对象图 dump：1570 行（wxdump31 产出）
 - 借道探针：wxdump32.cpp
 - 关键 RVA：send_message 0x19E5F00
+## 关键字段 dump 结果（决定性发现！）2026-10-25 06:00
+
+### 实测
+
+```
+receiver(+0xC0) 66696C6568656C706572 0A000000 0F000000  |filehelper|  ✓ 正确
+type(+0xE8)     0000000000000000                                    ✗ 是 0（不是 1）
+msglen(+0x198)  0000000000000000                                    ✗ 是 0
+uuid(+0x6B8)    0F000000...                                         （cap=15）
+content(+0x718) 24000000 2F000000 ...                               ✗ 不是文本
+atlist(+0x738)  0
+blk100(+0x100)  0
+```
+
+### 结论：新版 TextMessage 结构与旧版不同！
+
+旧版结构（我们一直用的）：
+```
+receiver  +0x0B0 (in msg, = msgBuf+0xC0) ✓ 正确
+type      +0x0D8 (= msgBuf+0xE8)          ✗ 实际是 0
+msg_len   +0x188 (= msgBuf+0x198)         ✗ 实际是 0
+content   +0x708 (= msgBuf+0x718)         ✗ 不是文本
+```
+
+**新版只有 receiver 位置没变，其他字段全部偏移了。**
+
+### 下一步（定位正确偏移）
+
+需要完整 dump msgBuf（0x748），搜用户发的消息文本（比如 "1"），找到 content 的真实位置，再反推 type/msg_len。
+
+### 当前状态
+
+```
+✅ receiver 偏移确认（+0xC0）
+✗ type/msg_len/content 偏移待重新定位（新版结构变化）
+```
+
+### 数据
+
+探针 wxdump33.cpp（只 dump 关键字段），wxdump31.cpp（全量 dump 但被截断）。
+
+**下一步**：改进 wxdump31（dump 完整 0x748 且确保日志不截断），然后搜消息文本定位 content。
