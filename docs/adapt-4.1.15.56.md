@@ -1319,3 +1319,40 @@ BuildSendParam2_Text(arg2);               // ★ 内部依赖 param2_* 偏移
 **B. 学习法**（稳）：
 - hook send_message（0x19E5F00），dump 用户手动发消息时的 arg1/arg2 内存
 - 分析真实结构后模仿
+## 抓到 send_message 的真实调用（2026-10-25 00:15）
+
+### wxdump25.dll
+
+hook `send_message`（RVA 0x19E5F00），dump 参数结构。
+
+### 实测（后台发消息 "hello new" 到文件传输助手）
+
+```
+=== send_message call #1 arg1=000001C505A0E000 arg2=000000370C5EA0E0 ===
+--- msgBuf (first 0x100) ---
+msgBuf+000 B86A98AEFB7F0000 06000000 02000000 486B98AEFB7F0000
+msgBuf+032 80C11D11C5010000 70C11D11C5010000 0000...（空）
+msgBuf+064 0F000000 ...        ← SmallString capacity = 15
+msgBuf+096 0F000000 ...
+msgBuf+128 0F000000 ...
+msgBuf+160 0F000000 0000... 01000000 0000... 07000000 ...
+msgBuf+192 66696C6568656C706572  ← "filehelper"（接收者 wxid）
+```
+
+### 关键发现
+
+1. `send_message` hook 生效（真实调用被捕获）
+2. msgBuf 布局：开头是指针（vtable）+ 长度/类型字段
+3. SmallString capacity = 15（0x0F）分布在多个偏移（+0x40/+0x60/+0x80/+0xA0...）
+4. **"filehelper" 是接收者 wxid**（文件传输助手）
+5. 旧版 `BuildTextMessage` 生成的结构与新版一致
+
+### 待修复
+
+`wsprintfA` 不支持 `%016llX`（输出 "lX"）——qword 格式化需要用 `%08X%08X`。
+
+### 下一步
+
+1. 修复格式化，重新 dump arg1/arg2 完整 qword
+2. 对照旧版 BuildTextMessage 的布局
+3. 构造参数调用 send_message
