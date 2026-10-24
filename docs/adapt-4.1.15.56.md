@@ -1545,3 +1545,63 @@ arg1[4] = 0
 2. 参照 arg2 dump 构造 arg2（0xE8）
 3. 调 send_message（base + 0x19E5F00）
 4. 验证发出文字
+## 消息对象结构完全解析（2026-10-25 01:40）
+
+### TextMessage 结构（旧版定义，新版 dump 验证一致）
+
+```cpp
+struct WeixinString {          // 0x20 字节
+    union { char inline_buf[16]; char* heap_buf; };
+    uint64_t length;           // +0x10
+    uint64_t cap;              // +0x18（15 = inline）
+};
+
+struct TextMessage {           // 从 msgBuf+0x10 开始
+    uint64_t pad0[22];         // 0x000
+    WeixinString receiver;     // 0x0B0  → msgBuf+0xC0（dump 里是 "filehelper" ✓）
+    uint64_t pad1[1];          // 0x0D0
+    uint64_t type;             // 0x0D8  → msgBuf+0xE8
+    uint64_t pad2[21];         // 0x0E0
+    uint64_t msg_len;          // 0x188  → msgBuf+0x198
+    uint64_t pad3[163];        // 0x190
+    WeixinString uuid;         // 0x6A8
+    uint64_t pad4[8];          // 0x6C8
+    WeixinString content;      // 0x708  → msgBuf+0x718
+    WeixinString atlist;       // 0x728
+};
+```
+
+**dump 验证**：
+- msgBuf+0xC0 = "filehelper"（receiver inline_buf）✓
+- msgBuf+0xD0 = 0x0A（length=10）✓
+- msgBuf+0xD8 = 0x0F（cap=15）✓
+
+结构完全对得上。
+
+### 发消息需要的东西（现状）
+
+| 项 | 值/状态 |
+|---|---|
+| send_message | base + 0x19E5F00 ✓ |
+| txt_message_vtbl | base + **0x9026AB8** ✓（从 dump 算出）|
+| param1_vtable | base + **0x92EA088** ✓ |
+| TextMessage 结构 | ✓ 完全解析 |
+| data 结构 | data[0]=msgBuf+2, data[1]=msgBuf ✓ |
+| arg1 结构 | ✓ |
+| **arg2 构造** | ❌ 需要 create_param2 + param2_1/2/3 偏移 |
+| **txt_message_ctr** | ❌ 构造器（旧版 0x6B2C30，新版特征匹配失败）|
+
+### 剩下两个函数（特征匹配失败，需要别的方法）
+
+1. `txt_message_ctr`（消息构造器，初始化 TextMessage 内部字段）
+   - 替代：直接按结构手填（跳过构造函数），但内部可能有必须初始化的字段
+2. `create_param2` + `param2_*`（arg2 构造）
+
+### 建议的下一步
+
+**A. 从 dump 复用**：把真实调用的 arg2（0xE8 字节）连同它指向的子结构一起 dump 下来，
+   在探针里照抄（指针改成我们自己的堆）。
+   
+**B. Ghidra 反编译**：在新版找 create_param2（可能需要局部反编译 + 人工判断）。
+
+先试 A（快）。
