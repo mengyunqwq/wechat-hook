@@ -3249,3 +3249,50 @@ param2 对象本身（堆）有效，但它的成员指针（数据库连接等�
 ❌ 直接发（确认不可行）
 ❌ 图片/语音/视频（需要构造结构 + 发送，发送是死结）
 ```
+## 回退完成（2026-10-25 19:54）
+
+### 已回退到 4.1.10.27
+
+```
+微信：D:\wxhook\wx4110\Weixin.exe（4.1.10.27）
+机器人：D:\wxhook\wx4110\version.dll（779KB，功能完整）
+HTTP：30001（/SendTextMsg 可用）
+```
+
+### 验证
+
+```
+/SendTextMsg → {"ret":0,"retmsg":"success"}
+截图：文件传输助手收到「旧版机器人恢复测试」
+```
+
+### 4.1.15.56 的已知问题（已记录）
+
+| 功能 | 状态 | 原因 |
+|---|---|---|
+| 读库（/messages）| ✅ 可用 | zstd 解压 |
+| 发文字（借道）| ✅ 可用 | hook + 触发 |
+| @艾特（借道）| ✅ 可用 | content + atlist |
+| 联系人（/contacts）| ✅ 可用 | step hook 读库 |
+| 直接发（无触发）| ❌ 不可行 | param2 对象成员 + 发送环节死结 |
+| 图片/语音/视频 | ❌ 未完成 | 需要构造结构 + 发送（同上死结）|
+
+### 探针源码（保留）
+
+```
+D:\微信deepseek\data\wxdump\wxdump18~63.cpp（各阶段探针）
+minhook/（MinHook 源码）
+```
+
+### 关键 RVA（4.1.15.56，备查）
+
+```
+api 表          0x9A907C0
+send_message    0x19E5F00
+txt_message_ctr 0x77AB70
+create_param2   0xF910
+txt_message_vtbl 0x9026AB8
+txt_message_vtbl2 0x9026B48
+param1_vtable   0x92EA088
+msgBuf 0x7B0，content=msg+0x758，receiver=msg+0xB0，atlist=msg+0x788
+```
