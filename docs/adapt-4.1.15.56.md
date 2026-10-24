@@ -1017,3 +1017,67 @@ MSG row 1:
 ✅ 枚举库表 / 识别消息库 / 读消息行
 🟡 消息正文：zstd 压缩，需解压（格式已识别）
 ```
+## 🎉🎉🎉 完全打通：新版消息内容成功解压（2026-10-24 21:50）
+
+### 完整链路（全部验证通过）
+
+```
+step hook（客户端线程）
+  → 枚举各库表 → 找到 Msg_xxx 表
+  → SELECT * FROM Msg_xxx ORDER BY rowid DESC LIMIT 1
+  → column_blob(#25) + column_bytes(#26) 取第 12 列原始字节（1568 字节）
+  → zstd 解压 → 13191 字节 XML
+```
+
+### 实测输出
+
+```
+COL 12 bytes=1568 hex=28B52FFD608732B530009A4D8C11...
+（28 B5 2F FD = zstd 魔数）
+
+解压后：
+<?xml version="1.0"?>
+<mmreader>
+  <category type="20" sub_type="0" ...>
+    <name><![CDATA[腾讯新闻]]></name>
+    <topnew><cover><![CDATA[https://...]]></cover></topnew>
+    <item>
+      <title><![CDATA[男子向情人转账2575万元...]]></title>
+      <url><![CDATA[https://view.inews.qq.com/...]]></url>
+```
+
+**这是真实的微信消息内容**（公众号推送）。
+
+### 新版槽位表（最终版）
+
+| 函数 | 槽位 |
+|---|---|
+| step | #100 |
+| prepare | #78 |
+| finalize | #63 |
+| column_text | #42 |
+| column_blob | #25 |
+| column_bytes | #26 |
+| column_int | #28 |
+| db_filename | #192（会崩，不用）|
+
+**规律：所有槽位 = sqlite3.h 标准索引 + 6**
+
+### 新版能力清单（核心全部打通）
+
+```
+✅ 注入（ilink 代理）
+✅ HTTP（30001）
+✅ 登录
+✅ 枚举库表 / 识别消息库（Msg_*）
+✅ 读消息行（localId/msgSvrId/type/createTime）
+✅ 取消息正文（zstd 压缩的 blob）
+✅ zstd 解压 → 真实 XML 内容
+```
+
+### 剩余工程工作
+
+1. C++ 里集成 zstd 解压（链接 zstd 库，或用微信自带的解压函数）
+2. 封装成 HTTP 接口（/QueryDB）
+3. 消息轮询 → 机器人收消息
+4. 发消息（需要另外 hook send_message / 消息构造）
