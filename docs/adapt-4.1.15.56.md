@@ -325,3 +325,39 @@ Weixin.dll+0x121D26
 6. wxdump 最初用 MinHook + CRT stdio 会导致 Weixin.exe 崩溃（0xC0000409）
    → 改成纯 Win32 + 手写 inline patch 后稳定
 ```
+## 当前进度（2026-10-24 14:45，压缩前存档）
+
+### 已完成
+
+1. **动态探针可用**：`wxdump.dll` 在 4.1.15.56 上成功 patch `ws2_32!send` 并抓到真实调用栈
+2. **发送调用栈**（4.1.15.56）：
+   ```
+   Weixin.dll+0x4DC7DFB   ← 网络发送封装（含 WSAGetLastError）
+   Weixin.dll+0x66C04CB
+   Weixin.dll+0x4E83297
+   Weixin.dll+0x4E7CD51
+   Weixin.dll+0x121D26
+   ```
+3. **Ghidra 12.2 + JDK 25 环境可用**，能反编译指定 RVA（0x4DC7D90 已验证）
+
+### 进行中（卡点）
+
+反编译调用栈上层函数时，脚本输出解析有问题（伪代码没保存到文件）。
+已创建 `E:\tools\gh_scripts\func_of_ret.java`（向前找函数起点 → 反编译），
+需要修正它把伪代码写到 `E:\tools\gh_out\<rva>.c`。
+
+### 下一步
+
+1. 修好 `func_of_ret.java` 的写文件逻辑（`PrintWriter` 那段替换没生效，需检查锚点）
+2. 依次反编译 0x4E7CD51 / 0x4E83297 / 0x66C04CB 所在函数
+3. 从中识别「构造 TextRequest → 调发送」的业务层 → 得到发送入口 RVA
+4. 把该 RVA 写进 hook 的新版分支，验证发文字
+
+### 工具速查
+
+```
+JAVA_HOME = E:\tools\jdk25\jdk-25.0.4.1+1
+headless  = E:\tools\ghidra\ghidra_12.2_PUBLIC\support\analyzeHeadless.bat
+项目      = E:\tools\gh_proj  （程序 /Weixin.dll，noanalysis）
+脚本目录  = E:\tools\gh_scripts
+```
