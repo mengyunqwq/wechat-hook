@@ -1857,3 +1857,65 @@ BT[25] WX+0x153D47D
 1. hook `0x19E5060`（4 参数）→ 抓参数结构（比 send_message 简单）
 2. 或反编译 `0x3DE9600` → 看参数（wxid/content）
 3. 找到"接收 wxid + text"的那一层 → 直接调用它就是 hook 式发消息
+## 发送包装与业务层的参数分析（2026-10-25 03:45）
+
+### 0x19E5060（发送包装，5 参数）
+
+```asm
+push rbp; push r15; push r14; push rsi; push rdi; push rbx
+sub rsp, 0x128
+lea rbp, [rsp+0x80]
+mov [rbp+0xa0], -2
+mov r14, r9        ← 第4参数
+mov r15, r8        ← 第3参数
+mov rsi, rdx       ← 第2参数
+mov rdi, rcx       ← 第1参数
+mov rbx, [rbp+0x100]  ← 第5参数（栈传递）
+```
+
+### 0x3DE9600（业务层，参数是对象）
+
+```asm
+sub rsp, 0x308
+mov r12, [rcx]        ← rcx 是对象指针
+mov rax, [r12+0x10]
+test rax, rax
+je ...
+cmp [rax+0x2a0], 0
+je ...
+mov rsi, rcx
+```
+
+### 调用点（0x3DE9B02）的参数来源
+
+```asm
+lea rdi, [rbp+0x38]   ← rcx = 栈上结构
+lea rdx, [rbp-0x30]   ← rdx
+lea r8, [rbp-8]       ← r8
+lea r9, [rbp+0xa0]    ← r9
+mov rcx, rdi
+call 0x19E5060
+```
+
+参数都是**业务层里的栈上结构体地址**（从 wxid/text 构造出来的）。
+
+### 结论
+
+- 0x19E5060 不能直接调（需要业务层构造的结构体）
+- 真正的"接收 wxid + text"入口在更上层（BT[04] 0x3DE8311 / BT[05] 0x3DE66CC ...）
+
+### 下一步
+
+沿调用栈往上追（BT[04] 0x3DE8311），找「接收 wxid + text」的那个函数。
+那一层才是能直接调用的入口（参数简单）。
+
+### 本次会话的完整成果
+
+```
+✅ 注入 / HTTP / 登录（后台）
+✅ 读库（枚举/消息行/zstd 解压）
+✅ HTTP /status /messages（202ms 真实数据）
+✅ 发消息调用链完整（38 层栈）
+✅ 关键函数：send_message(0x19E5F00) / 发送包装(0x19E5060) / 业务层(0x3DE9600)
+🟡 发消息入口：需继续上追 1~2 层（BT[04]/BT[05]）
+```
