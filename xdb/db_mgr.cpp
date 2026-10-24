@@ -1655,6 +1655,10 @@ private:
         }
         OutputDebugStringA("[db_registry] prepare 钩子已安装（句柄按真实查询记录）\n");
 
+        // 新版（4.1.15+）只保留 prepare：其余探针（prepare16/bind*/exec/step/probe::arm）
+        // 内部依赖旧版结构偏移，装到新版上会崩。DB 读所需的最小集 = prepare + open16。
+        if (g_WxVersion != 0) return;
+
         // ── 第二轮：把其它 SQL 入口一次挂全 ──────────────────────────────
         // 第一轮实测"消息写库不经过 prepare"，所以把这张表上所有可能承载 SQL 的入口都挂上，
         // 一次部署就能看出写库到底走哪个（全部失败也不影响主路径，纯探针）。

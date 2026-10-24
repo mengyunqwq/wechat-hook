@@ -249,7 +249,7 @@ void Evt_WeixinLoad()
 
     // 数据库钩子早装（Release 也要跑）：登录前就把 open16/prepare 挂好，
     // 否则客户端秒登录时 DB 在装钩子之前就打开了，句柄永远登记不上。
-    xmgr::StartEarlyArmThread();
+    if (g_WxVersion == 0) xmgr::StartEarlyArmThread();   // 新版先空跑（不装 DB 钩子）验证稳定性
     
 
     
