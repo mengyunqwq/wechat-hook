@@ -1486,3 +1486,62 @@ msgBuf:
 
 先做 **C**（收消息接入桥）——读库已经完全可用，机器人能跑起来。
 发消息（A/B）后续专门处理。
+## 🎯 抓到完整参数结构（2026-10-25 01:20）
+
+### 真实调用 dump（BASE=0x7FFBA5960000）
+
+```
+arg1+000 88A0C4AEFB7F0000 F05453138A010000 005553138A010000 005553138A010000
+arg1+032 0000000000000000
+
+arg2+000 604D53138A010000 504D53138A010000 AAAAAAAAAAAAAAAA AAAAAAAAAAAAAAAA
+arg2+064 ... E0EFCE138A010000 088E0CAFFB7F0000 602243108A010000
+arg2+128 ... B09BB39D72000000 688D0CAFFB7F0000 602243108A010000
+arg2+160 0086C0108A010000 0300000001000000 00000000AAAAAAAA
+arg2+192 ... F09BB39D72000000 84060000 00000000 00000000
+
+data+000 007563138A010000 F07463138A010000 00000000 D1CBC8FFAE5AA219D3BE0388
+msgBuf+000 B86A98AEFB7F0000 06000000 02000000 486B98AEFB7F0000 007563138A010000
+msgBuf+032 F07463138A010000 ...
+msgBuf+192 66696C6568656C706572 = "filehelper"
+```
+
+### 算出的 RVA（关键成果）
+
+| 项 | 运行地址 | RVA |
+|---|---|---|
+| param1_vtable | 0x7FFBAEC4A088 | **0x92EA088** |
+| 消息对象 vtable | 0x7FFBAE986AB8 | **0x9026AB8** |
+| 消息对象 vtable2 | 0x7FFBAE986B48 | **0x9026B48** |
+
+### arg1 结构（0x28）
+
+```
+arg1[0] = base + 0x92EA088   (param1_vtable)
+arg1[1] = data               (0x18A135354F0)
+arg1[2] = data + 0x10
+arg1[3] = data + 0x10
+arg1[4] = 0
+```
+
+### msgBuf 结构（0x200，实测）
+
+```
++0x00  base + 0x9026AB8     (vtable)
++0x08  06 00 00 00 02 00 00 00
++0x10  base + 0x9026B48
++0x18  堆指针（SmallString data）
++0x20  堆指针（msgBuf 自身）
++0x40  0F (capacity 15)
++0x60  0F
++0x80  0F
++0xA0  0F
++0xC0  "filehelper"  ← 接收者
+```
+
+### 下一步
+
+1. 参照旧版 `BuildTextMessage`（src/wx_send.cpp）用新 RVA 构造 msgBuf
+2. 参照 arg2 dump 构造 arg2（0xE8）
+3. 调 send_message（base + 0x19E5F00）
+4. 验证发出文字
