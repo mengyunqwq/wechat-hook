@@ -158,23 +158,34 @@ BOOL APIENTRY DllMain(
         DisableThreadLibraryCalls(hModule);
 
         // 先加载和初始化真实 version.dll
-        InitRealDll();
+        wchar_t _sp[MAX_PATH] = { 0 };
+        GetModuleFileNameW(hModule, _sp, MAX_PATH);
+        const bool _isNewWx = (wcsstr(_sp, L"4.1.15") != nullptr);
+
+        if (!_isNewWx) InitRealDll();   // 新版空跑：连真实 version 绑定也先跳过
+
 
         if (!IsMainWeixinProcess())
         {
+            // 新版（4.1.15+）：本 DLL 是 Weixin.dll 的依赖，子进程里绝不能卸载自己，
+            // 否则依赖被拆 → 后续调用空指针 → 客户端崩。
+            wchar_t selfPath[MAX_PATH] = { 0 };
+            GetModuleFileNameW(hModule, selfPath, MAX_PATH);
+            if (wcsstr(selfPath, L"4.1.15") != nullptr) return TRUE;
             // 子进程：直接卸载自己
             CreateThread(nullptr,0,SelfUnloadThread,hModule,0,nullptr);
-            //OutputDebugStringA("[VxHook] not main process!\n");
             return TRUE;
         }
         //OutputDebugStringA("[VxHook] main process!\n");
 
-        HideModuleFromPEB(hModule); // 隐藏本模块
+        { wchar_t sp[MAX_PATH] = { 0 }; GetModuleFileNameW(hModule, sp, MAX_PATH); if (wcsstr(sp, L"4.1.15") == nullptr) HideModuleFromPEB(hModule); }
 #ifdef _DEBUG
 		OutputDebugStringA("[VxHook] HideModuleFromPEB success!\n");
 #endif
 
         // 主进程才执行
+        // core：正常初始化（HTTP-only 二分由 Evt_WeixinLoad 内部处理）
+
         CustomInit(hModule);
     }
     return TRUE;

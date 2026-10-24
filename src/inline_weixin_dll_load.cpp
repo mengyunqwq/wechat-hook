@@ -215,6 +215,17 @@ void Evt_WeixinLoad()
     
     DetectWxVersion();
 
+    // ── 二分：新版先只起 HTTP 服务，其余初始化全部跳过 ──
+    if (g_WxVersion != 0) {
+        if (!g_httpServer) {
+            g_httpServer = new HttpServer();
+            g_httpServer->Start("127.0.0.1", g_StartPort);
+        }
+        xmgr::StartEarlyArmThread();   // 二分第 2 步：加回 DB 钩子（open16/prepare）
+        OutputDebugStringA("[init] 新版：仅 HTTP 服务（二分模式）\n");
+        return;
+    }
+
     if (g_WxVersion == 0) Patch_Revoke();   // 防撤回补丁：旧偏移，新版跳过
 
     // ── VOICE-DUMP：只读埋点（默认关）──────────────────────────────

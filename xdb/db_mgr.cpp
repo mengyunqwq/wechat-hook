@@ -1637,6 +1637,7 @@ private:
 
     void installPrepare(sqlite3_api_routines* api) {
         std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
+        if (g_WxVersion != 0) return;   // 新版：不装 MinHook，改用 install() 改表
         if (g_installedPrepare || api == nullptr || api->prepare == nullptr) return;
         g_installedPrepare = true;
         g_api = api;
@@ -1690,6 +1691,7 @@ private:
     //       所以改表没用。但 api->open_v2 本身就是"真实函数的地址"，
     //       直接 hook 这段代码即可。用 MinHook（自带指令边界处理，不会把指令截断）。
     void installCode(sqlite3_api_routines* api) {
+        if (g_WxVersion != 0) return;   // 新版：MinHook 挂钩会触发客户端校验 → 崩，只用改表
         std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
         if (g_installedCode || api == nullptr || api->open_v2 == nullptr) return;
         g_installedCode = true;
@@ -1768,27 +1770,54 @@ private:
     }
 
     // 安装：把 API 表里的 open_v2 指向 detour（表在 .rdata，需要临时改页保护）
+    // 安装：把 API 表里的 open_v2 / open16 / prepare 指向我们的 detour（改数据、不动代码）
     void install(sqlite3_api_routines* api) {
         std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
-        if (g_installed || api == nullptr || api->open_v2 == nullptr) return;
+        if (g_installed || api == nullptr) return;
         g_installed = true;
-        g_origOpenV2 = (open_v2_t)api->open_v2;
 
-        DWORD oldProt = 0;
-        void** slot = (void**)&api->open_v2;
-        if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
-            *slot = (void*)&detourOpenV2;
-            DWORD tmp = 0;
-            VirtualProtect(slot, sizeof(void*), oldProt, &tmp);
-            OutputDebugStringA("[db_registry] open_v2 钩子已安装（数据库句柄将按真实打开记录）\n");
-        } else {
-            OutputDebugStringA("[db_registry] open_v2 钩子安装失败（继续用扫描方式）\n");
-            g_origOpenV2 = nullptr;
-            g_installed = false;
+        auto patchSlot = [](void** s, void* fn) -> bool {
+            DWORD op = 0;
+            if (!VirtualProtect(s, sizeof(void*), PAGE_READWRITE, &op)) return false;
+            *s = fn;
+            DWORD t = 0;
+            VirtualProtect(s, sizeof(void*), op, &t);
+            return true;
+        };
+
+        if (api->open_v2 != nullptr) {
+            open_v2_t orig = (open_v2_t)api->open_v2;
+            if (patchSlot((void**)&api->open_v2, (void*)&detourOpenV2)) {
+                g_origOpenV2 = orig;
+                OutputDebugStringA("[db_registry] open_v2 表项已替换\n");
+            }
+        }
+        char _dbMode[32] = { 0 };
+        GetEnvironmentVariableA("WXHOOK_DB", _dbMode, sizeof(_dbMode));   // 调试开关：o16 / prep / both
+        const bool _doO16 = (strstr(_dbMode, "o16") != nullptr);
+        const bool _doPrep = (strstr(_dbMode, "prep") != nullptr);
+        // 新版（4.1.15+）：MinHook 挂钩会被客户端校验 → 崩；open16/prepare 也只用改表
+        if (g_WxVersion != 0) {
+        if (_doO16 && api->open16 != nullptr) {
+                open16_t o16 = (open16_t)api->open16;
+                if (patchSlot((void**)&api->open16, (void*)&detourOpen16)) {
+                    g_origOpen16 = o16;
+                    g_installedOpen16 = true;
+                    OutputDebugStringA("[db_registry][new] open16 表项已替换\n");
+                }
+            }
+        if (_doPrep && api->prepare != nullptr) {
+                prepare_t op = (prepare_t)api->prepare;
+                if (patchSlot((void**)&api->prepare, (void*)&detourPrepare)) {
+                    g_origPrepare = op;
+                    g_installedPrepare = true;
+                    OutputDebugStringA("[db_registry][new] prepare 表项已替换\n");
+                }
+            }
         }
     }
 
-    // 说明：原来这里还有一个"open_v2 登记表快照"（snapshot），它会逐条对句柄做
+    // 说明：原来这里还有一个"open_v2 登记表快照"（snapshot），它会逐条对句柄做只读探测 —— 已删除。
     // 只读探测 + "真能查"探测来剔除失效项 —— 那套主动探测已经全部删掉。
     // 现在注册表只剩一个来源（g_slot 原子表），失效判定统一由 noteQueryResult 负责。
 }
