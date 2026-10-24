@@ -608,3 +608,44 @@ MinHook 已处理指令重定位，能避免竞态。
 1. 用 MinHook 重写 step 探针（trampoline 模式）
 2. 抓 INSERT/UPDATE 的 SQL 文本 + 顺序栈 → 定位「写消息」业务层
 3. 拿到业务层 RVA → 写进 hook
+## 探针演进与当前状态（2026-10-24 16:50）
+
+### 探针版本线
+
+| 版本 | 方式 | 结果 |
+|---|---|---|
+| wxdump5 | 外部栈采样（SuspendThread）| 可用，但分辨率不足 |
+| wxdump6 | prepare 断点（恢复/重打）| 发消息不走 prepare |
+| wxdump7 | step 断点（恢复/重打）| 抓到 200 条栈，但**竞态崩溃**（安全模式）|
+| wxdump8 | step + 读 SQL（恢复/重打）| 崩 |
+| wxdump9 | MinHook trampoline | MH_EnableHook 成功但**未触发** |
+| **wxdump10** | **手动 trampoline（一次 patch 永久保持）** | **hook 正常触发（STEP HIT 验证）**，但 SQL/db 名读取有问题 |
+
+### 已验证的技术点
+
+```
+1. 手动 trampoline 可行：copy 12 字节 + jmp 回原函数 + 12，一次 patch 无竞态
+2. 目标地址正确：api 表(0x9A907C0) #100 槽 = step = RVA 0x5927600
+3. 登录时 step 被调用（STEP HIT 出现 5 次）
+```
+
+### 卡点
+
+```
+api 表 #161 槽（sqlite3_sql）返回 NULL → 拿不到 SQL 文本
+用 stmt->db + api->db_filename(#192) 过滤 message 库 → 崩溃
+```
+
+### 下一步（换方案）
+
+**栈特征过滤**：不用 SQL/db 名，改为「栈里含 Qt UI 层地址（0x6000000-0x7000000）才记录」——
+用户操作（发消息）触发的 DB 写入会经过 UI 层，后台轮询不会。
+这样能精确抓到「发消息」的 step 调用链。
+
+### 已抓到的完整调用链（117 帧，256KB 扫描）
+
+业务层候选（非 Qt/WCDB）：
+```
+0x3FA8E1 / 0x3FA8D0 / 0x3FA890 / 0x691D24 / 0x47BABE
+0x2296BF / 0xD8946A / 0xD8C8DC / 0xD8D64B / 0x4A11FE / 0x3E1FC / 0x4A3F2F
+```
