@@ -1356,3 +1356,40 @@ msgBuf+192 66696C6568656C706572  ← "filehelper"（接收者 wxid）
 1. 修复格式化，重新 dump arg1/arg2 完整 qword
 2. 对照旧版 BuildTextMessage 的布局
 3. 构造参数调用 send_message
+## 回答：能不能跟以前一样发消息？
+
+**能，完全一样。** 旧版那套做法在新版是可行的：
+
+```cpp
+// 1. 构造 TextMessage（0x768）
+msgBuf = HeapAlloc(0x768);
+BuildTextMessage(msgBuf, msg, wxid, atlist);   // 内部布局与旧版一致（已抓证）
+
+// 2. data
+data[0] = msgBuf + 2; data[1] = msgBuf;
+
+// 3. arg1（vtable + data）
+arg1[0] = base + param1_vtable;   // ← 只差这个偏移
+arg1[1] = data;
+arg1[2] = data + 0x10; arg1[3] = data + 0x10; arg1[4] = 1;
+
+// 4. arg2（0xE8）
+BuildSendParam2_Text(arg2);       // ← 依赖 param2_* 偏移
+
+// 5. 调用
+send_message(arg1, arg2);         // ← 新版 0x19E5F00（已定位）
+```
+
+### 唯一要补的：3~4 个偏移值
+
+旧版靠特征码定位（g_pat_8~14），新版特征失效。但**我们抓到了真实调用**，
+从真实调用的内存里可以直接读出：
+- arg1[0] = param1_vtable 的真实值
+- msgBuf[0] = 消息对象 vtable
+- arg2 的内容 = BuildSendParam2_Text 的产物
+
+### 当前状态
+
+- `send_message` hook 已生效（抓到了 1 次真实调用，msgBuf 里有 "filehelper"）
+- 最近一次测试 UI 点击没对上，没触发（窗口坐标问题）
+- 待办：修 UI 自动化 + 完整解析 arg1/arg2（格式化已修好：%08X%08X）
