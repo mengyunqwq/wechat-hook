@@ -869,3 +869,51 @@ QUERY rc=100 text=count(*) int=1
 2. 缓存 db 句柄（多个库）
 3. 把查询结果通过 HTTP 接口暴露（/QueryDB）
 4. 再接消息轮询
+## 🎉🎉 新版读库完全打通（2026-10-24 20:35）
+
+### 关键修正：column_text 槽位是 #42（不是 #36）
+
+api 表存在 **+6 槽位偏移**：
+- `column_name` 实际在 #30 → 我们之前用 #36 读到的是列名（"name"）而不是值
+- `column_text` 实际在 **#42**（= 36 + 6）
+
+### 实测：成功列出各库的表
+
+```
+DB #1   tables: LoginKeyInfoTable
+DB #201 tables: contact, name2id, encrypt_name2id, chat_room,
+                 chat_room_info_detail, stranger, ticket_info, ...
+DB #401 tables: name2id
+```
+
+**这是真的读到了微信的数据库结构**（contact 库的表名全部正确）。
+
+### 完整可用链路（已验证）
+
+```
+step hook（客户端线程）
+  → db = *(void**)stmt              (stmt 偏移 0 = db)
+  → prepare(#78)(db, sql, -1, &stmt2, 0)
+  → step via trampoline(stmt2)      (原函数，不递归)
+  → column_text(#42)(stmt2, 0)      (★ 槽位 42)
+  → finalize(#63)(stmt2)
+```
+
+### 槽位表（4.1.15.56 实测）
+
+| 函数 | 槽位 |
+|---|---|
+| step | #100 |
+| prepare | #78 |
+| finalize | #63 |
+| **column_text** | **#42**（不是 36！）|
+| column_int | #28 |
+| db_filename | #192（调用会崩，不用）|
+| open | #76 / #77 / #143（微信不走表，hook 不到）|
+| sql | #161（返回 NULL，不用）|
+
+### 下一步
+
+1. 枚举更多库，找到 message 库（表名可能含 msg/chat）
+2. 对 message 库执行 `SELECT * FROM <表名> ORDER BY rowid DESC LIMIT 10`
+3. 把结果通过 HTTP 暴露
