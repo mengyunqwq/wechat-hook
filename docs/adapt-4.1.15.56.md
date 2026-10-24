@@ -513,3 +513,31 @@ sqlite：  0x5926DC0 / 0x5928186 / 0x593CBFB / 0x594B279
 应该能看到「业务层 → WCDB → sqlite」的完整链条，才能定位发送入口。
 
 （机器人未启动，微信 4.1.15.56 在跑，随时可测。）
+## 256KB 栈扫描：看到完整层次（2026-10-24 15:52）
+
+把 wxdump7 的栈扫描范围从 32KB 放大到 256KB 后重抓，得到 170 个唯一地址。按区域定性：
+
+| 区域 | 字符串特征 | 定性 |
+|---|---|---|
+| `0x61xxxxx` | SNSWindow / GridImage / QScrollArea / ChatBotHistory / sns_timeline | **Qt GUI 层**（UI 线程）|
+| `0x35Bxxxx-0x364xxxx` | Unpaired lock / Checkpoint / WAL / cipher | WCDB 锁/加密层 |
+| `0x148xxxx-0x14Cxxxx` | WCDB.Operation / Backup / Migrate | WCDB SQL 层 |
+| `0x592xxxx` | sqlite 内核 | sqlite |
+
+**完整链条**：`Qt UI (0x61x) → 业务层 → WCDB (0x35B/0x149) → sqlite (0x592)`
+
+### 非 WCDB / 非 UI 的候选地址（待定性）
+
+```
+0x3B3E91 / 0x3B4262 / 0x3B4B1D / 0x3BC89D     (0x3B 区域)
+0x3FF3F3 / 0x3FF404 / 0x3FF418 ... (0x3FF 区域，一串相邻)
+0x4E7B3C                                        (接近网络层 0x4E7CD51)
+0xD8C8DC
+0x117FE1 / 0x13003C
+```
+
+### 下一步
+
+1. 定性 0x3FF 区域 / 0xD8C8DC（扫字符串）
+2. 找到「发送消息」业务函数（很可能在 0x3FF 或 0xD8 段）
+3. 从该函数反推：它是否调用 WCDB 插入 + 网络发送
