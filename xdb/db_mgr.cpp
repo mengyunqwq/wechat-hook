@@ -26,6 +26,9 @@
 //        微信每打开一个数据库就记下 {句柄 → 文件名}，直接用真实记录。
 //        记录为空时仍回退到原来的扫描（保证老库也能发现）。
 // ══════════════════════════════════════════════════════════════════
+static void codec_get_key(sqlite3CodecGetKey func, sqlite3* db, int index, void** pKey, int* pLen);   // 前置声明（定义在文件后半段）
+static sqlite3CodecGetKey g_codecGetKeyFn = nullptr;   // 在客户端线程里取密钥用（方案 A-2）
+
 namespace db_registry {
     // ══════════════════════════════════════════════════════════════════
     //  数据库句柄登记表（2026-10-19 第二次重做 · 干净版）
@@ -52,6 +55,9 @@ namespace db_registry {
     // 安装钩子的互斥：早装线程 / DatabaseMgr 构造 / HTTP 线程可能同时进来
     std::recursive_mutex g_installMtx;
 
+std::atomic<long long> g_connLockOk{ 0 };     // 成功拿到连接锁的次数
+std::atomic<long long> g_connLockNull{ 0 };   // db_mutex 为空/未生效的次数（锁没起作用）
+
 // ── 连接级互斥（对齐 sqlite 自己的连接锁）────────────────────────
 // 背景：我们通过 sqlite3_api_routines 直接调 prepare/step/finalize，
 //       这些是内部实现，**不拿连接锁**（公开 sqlite3_prepare_v2 才会 enter）。
@@ -60,12 +66,18 @@ namespace db_registry {
 class SqliteConnLock {
 public:
     explicit SqliteConnLock(sqlite3* db) {
-        if (g_api && g_api->db_mutex && g_api->mutex_enter && db) {
+        if (db == nullptr) return;
+        if (g_api && g_api->db_mutex && g_api->mutex_enter) {
             m_mutex = g_api->db_mutex(db);
             if (m_mutex) {
                 g_api->mutex_enter(m_mutex);
                 m_locked = true;
+                g_connLockOk.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_connLockNull.fetch_add(1, std::memory_order_relaxed);
             }
+        } else {
+            g_connLockNull.fetch_add(1, std::memory_order_relaxed);   // 槽位缺失 → 锁没起作用
         }
     }
     ~SqliteConnLock() {
@@ -187,6 +199,35 @@ private:
     // 前向声明：safeDbName 定义在本命名空间后面（用 api->db_filename 只读取名）
     inline bool safeDbName(void* handle, std::string& out);
 
+    // ── 方案 A-2：在**客户端线程**里把每个库的 SQLCipher 密钥抓下来 ──
+    //   为什么不在我们自己的线程调 codec_get_key：那等于又一次跨线程读客户端连接，
+    //   实测会把客户端搞崩。这里只在客户端调用 prepare 的上下文里读一次（安全）。
+    std::mutex g_keyMtx;
+    std::map<std::string, std::string> g_keys;      // 库路径 → 原始密钥
+
+    inline void tryCaptureKey(void* db) {
+        if (g_WxVersion != 0) return;   // 新版 codec 偏移未适配：不抓密钥（会崩）`n        if (g_codecGetKeyFn == nullptr || db == nullptr) return;
+        std::string path;
+        if (!safeDbName(db, path) || path.empty()) return;
+        {
+            std::lock_guard<std::mutex> lg(g_keyMtx);
+            if (g_keys.find(path) != g_keys.end()) return;   // 已抓过
+        }
+        void* pKey = nullptr;
+        int nKey = 0;
+        ::codec_get_key(g_codecGetKeyFn, (sqlite3*)db, 0, &pKey, &nKey);
+        if (pKey == nullptr || nKey <= 0) return;
+        std::lock_guard<std::mutex> lg(g_keyMtx);
+        g_keys[path] = std::string((const char*)pKey, (size_t)nKey);
+    }
+
+    inline bool keyForPath(const std::string& path, std::string& out) {
+        std::lock_guard<std::mutex> lg(g_keyMtx);
+        auto it = g_keys.find(path);
+        if (it == g_keys.end()) return false;
+        out = it->second;
+        return true;
+    }
     // ★★ prepare detour 的**唯一**动作：记一条映射 ★★
     //   O(1)、无锁、不调 API、不读内存、不做 I/O、不打日志。
     //   首次见到的句柄也只是 CAS 占一个槽（无分配、无锁、无系统调用）。
@@ -202,6 +243,7 @@ private:
         if (c != nullptr) {
             c->tick.store(nowMs(), std::memory_order_relaxed);
             g_registrations.fetch_add(1, std::memory_order_relaxed);
+        tryCaptureKey(db);   // 客户端线程里顺手抓密钥（方案 A-2，安全）
             g_lastRegMs.store(nowMs(), std::memory_order_relaxed);   // 新句柄出现（只在首次登记时写）
         }
     }
@@ -349,6 +391,13 @@ private:
         out.lastFail = s->lastFail.load(std::memory_order_relaxed);
         out.src = s->src.load(std::memory_order_relaxed);
         return true;
+    }
+
+    // 句柄 → 库名（只用登记表，不碰客户端连接对象；比 db_filename 安全）
+    inline bool nameForHandle(void* h, std::string& out) {
+        Entry e;
+        if (entryByHandle(h, e) && !e.name.empty()) { out = e.name; return true; }
+        return false;
     }
 
     inline size_t liveCount() {
@@ -1701,6 +1750,19 @@ private:
         if (!g_installedPrepare && api->prepare != nullptr) installPrepare(api);
     }
 
+// 连接锁自检：db_mutex 槽位是否有效、锁是否真的拿到（给 /Debug/DBRescan 用）
+    inline nlohmann::ordered_json reportConnLock(uintptr_t modBase, uintptr_t modSize) {
+        nlohmann::ordered_json j;
+        const uintptr_t slot = (g_api != nullptr) ? (uintptr_t)g_api->db_mutex : 0;
+        j["db_mutex_slot"] = format_string("0x%llX", (unsigned long long)slot);
+        j["db_mutex_in_module"] = (modBase != 0 && modSize != 0 && slot >= modBase && slot < modBase + modSize);
+        j["lock_ok"] = g_connLockOk.load(std::memory_order_relaxed);
+        j["lock_null"] = g_connLockNull.load(std::memory_order_relaxed);
+        j["effective"] = (g_connLockOk.load(std::memory_order_relaxed) > 0);
+        j["note"] = "effective=false 且 lock_null>0 → 这把锁没起作用（db_mutex 槽位不对/连接非 FULLMUTEX）";
+        return j;
+    }
+
     // 安装：把 API 表里的 open_v2 指向 detour（表在 .rdata，需要临时改页保护）
     void install(sqlite3_api_routines* api) {
         std::lock_guard<std::recursive_mutex> _ilk(g_installMtx);
@@ -1820,10 +1882,91 @@ namespace xmgr {
 		}
 	}
 
+// ══════════════════════════════════════════════════════════════════
+	//  方案 A：自开只读连接（不碰客户端连接 → 从根上避免并发踩内存）
+	//
+	//  背景：这个微信的 sqlite 是 THREADSAFE=2（multi-thread），连接**没有互斥锁**
+	//  （db_mutex 返回 NULL），所以"拿连接锁"这条路走不通。客户端自己用上层锁保护，
+	//  我们从别的线程并发用它的连接就是不安全的。
+	//
+	//  做法：用 codec_get_key 拿到该库的 SQLCipher 密钥 → 用**同一套 sqlite/sqlcipher
+	//  函数**自己 open_v2(READONLY) 一个连接 + sqlcipher key() 解密 → SELECT 全走它。
+	//  写语句仍然走客户端连接（写很少，且写权限只属于客户端）。
+	// ══════════════════════════════════════════════════════════════════
+	sqlite3* DatabaseMgr::ownConnectionFor(sqlite3* clientDb) {
+		if (clientDb == nullptr || m_sqlite3Rountines == nullptr) return nullptr;
+		if (m_sqlite3Rountines->db_filename == nullptr || m_sqlite3Rountines->open_v2 == nullptr) return nullptr;
+
+		std::string pathStr;
+		if (!db_registry::nameForHandle(clientDb, pathStr) || pathStr.empty()) {
+		    const char* p0 = (const char*)m_sqlite3Rountines->db_filename(clientDb, "main");   // 最后兜底
+		    if (p0 == nullptr || *p0 == 0) return nullptr;
+		    pathStr = p0;
+		}
+		const char* path = pathStr.c_str();
+		if (path == nullptr || *path == '\0') return nullptr;
+
+		std::lock_guard<std::mutex> lg(m_ownMtx);
+		auto it = m_ownDbs.find(path);
+		if (it != m_ownDbs.end()) return it->second;
+
+		std::string key2;
+		if (!db_registry::keyForPath(path, key2) || key2.empty()) {
+			OutputDebugStringA("[own_db] 该库密钥还没抓到（等客户端 prepare），暂用客户端连接\n");
+			return nullptr;
+		}
+		const void* pKey = key2.data();
+		const int kLen = (int)key2.size();
+		sqlite3* own = nullptr;
+		int rc = m_sqlite3Rountines->open_v2(path, &own, 0x00000001 /*SQLITE_OPEN_READONLY*/, nullptr);
+		if (rc != 0 || own == nullptr) {
+			OutputDebugStringA("[own_db] open_v2(READONLY) 失败，回退客户端连接\n");
+			return nullptr;
+		}
+		if (m_sqlcipherRountines != nullptr && m_sqlcipherRountines->key != nullptr) {
+			if (m_sqlcipherRountines->key(own, pKey, kLen) != 0) {
+				OutputDebugStringA("[own_db] sqlcipher key() 失败，回退客户端连接\n");
+				m_sqlite3Rountines->close(own);
+				return nullptr;
+			}
+		} else {
+			m_sqlite3Rountines->close(own);
+			return nullptr;
+		}
+
+		m_ownDbs[path] = own;
+		OutputDebugStringA((std::string("[own_db] 已开独立只读连接: ") + path + "\n").c_str());
+		return own;
+	}
+
+void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
+		if (clientDb == nullptr || m_sqlite3Rountines == nullptr || m_sqlite3Rountines->db_filename == nullptr) return;
+		const char* path = (const char*)m_sqlite3Rountines->db_filename(clientDb, "main");
+		if (path == nullptr) return;
+		std::lock_guard<std::mutex> lg(m_ownMtx);
+		auto it = m_ownDbs.find(path);
+		if (it != m_ownDbs.end()) {
+			try { m_sqlite3Rountines->close(it->second); } catch (...) {}
+			m_ownDbs.erase(it);
+			OutputDebugStringA("[own_db] 丢弃独立连接，回退客户端连接\n");
+		}
+	}
+
 	nlohmann::ordered_json DatabaseMgr::execute(sqlite3* db, const std::string& sql)
 	{
         std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：避免 httplib 两个工作线程同时进客户端 sqlite
         db_registry::SqliteConnLock _conn(db);   // ★ 连接锁：与客户端线程互斥（根治 lookaside 损坏）
+
+        // 方案 A：只读 SQL 走我们自己的只读连接（不碰客户端连接）
+        sqlite3* runDb = db;
+        bool useOwn = false;
+        {
+            std::string s2;
+            for (char c : sql) { if (!isspace((unsigned char)c)) { s2.push_back((char)toupper((unsigned char)c)); } if (s2.size() >= 6) break; }
+            if (s2 == "SELECT" || s2 == "PRAGMA" || s2 == "WITH" || s2 == "EXPLAIN") {
+                if (sqlite3* own = ownConnectionFor(db)) { runDb = own; useOwn = true; }
+            }
+        }
         db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
 		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		if (db == nullptr) {
@@ -1832,11 +1975,18 @@ namespace xmgr {
 			return rdata;
 		}
 		sqlite3_stmt* stmt = nullptr;
-		int rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
+		int rc = m_sqlite3Rountines->prepare((LPVOID)runDb, sql.c_str(), -1, &stmt, 0);
 		// ★★ 句柄好坏的**唯一**判据就在这里：真实查询的返回码。
 		//    我们不主动去试句柄；只有真实查询（桥发来的 SQL / 取名扫描 / backup）
 		//    返回连接级错误时，才给这个句柄记一次失败；成功一次就清零。
 		db_registry::noteQueryResult((void*)db, rc);
+		if (rc != SQLITE_OK && useOwn && runDb != db) {
+		    // 独立连接失败（WAL 锁 / 密钥 / 只读限制）→ 丢弃缓存，回退客户端连接重试一次
+		    forgetOwn(db);
+		    runDb = db;
+		    stmt = nullptr;
+		    rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
+		}
 		if (rc != SQLITE_OK) {
 			rdata["status"] = rc;
 			rdata["desc"] = format_string("execute %s failed", "sqlite3_prepare");
@@ -2285,6 +2435,32 @@ namespace xmgr {
 		j["registry"] = db_registry::reportRegistry();
 		j["name_pass"] = db_registry::reportNamePass();
 		j["counters"] = db_registry::reportCounters();
+		{
+		    const uintptr_t b = (uintptr_t)g_hWeixinDll;
+		    uintptr_t s = (uintptr_t)g_MyModuleSize;
+		    if (s == 0 && b != 0) {
+		        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)b;
+		        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+		            const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(b + (uintptr_t)dos->e_lfanew);
+		            if (nt->Signature == IMAGE_NT_SIGNATURE) s = (uintptr_t)nt->OptionalHeader.SizeOfImage;
+		        }
+		    }
+		    j["conn_lock"] = db_registry::reportConnLock(b, s);
+		    {
+		        std::lock_guard<std::mutex> lgOwn(m_ownMtx);
+		        nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+		        for (auto& kv : m_ownDbs) arr.push_back(kv.first);
+		        j["own_dbs"] = arr;
+		        j["own_db_count"] = (int)m_ownDbs.size();
+		        {
+		            std::lock_guard<std::mutex> lgK(db_registry::g_keyMtx);
+		            nlohmann::ordered_json arr2 = nlohmann::ordered_json::array();
+		            for (auto& kv : db_registry::g_keys) arr2.push_back(kv.first);
+		            j["keys_captured"] = arr2;
+		            j["key_count"] = (int)db_registry::g_keys.size();
+		        }
+		    }
+		}
 		j["IsLogin"] = g_IsLogin;
 		j["note"] = "只读快照：不跑任何 SQL、不改任何状态；POST {\"force\":true} 才触发一次（30 秒节流）";
 		return j;
@@ -2322,7 +2498,14 @@ namespace xmgr {
 	nlohmann::ordered_json DatabaseMgr::apiTableReport() {
 		nlohmann::ordered_json j;
 		const uintptr_t base = (uintptr_t)g_hWeixinDll;
-		const uintptr_t size = (uintptr_t)g_MyModuleSize;
+		uintptr_t size = (uintptr_t)g_MyModuleSize;
+		if (size == 0 && base != 0) {                    // 兜底：读 PE 的 SizeOfImage
+		    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+		    if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+		        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + (uintptr_t)dos->e_lfanew);
+		        if (nt->Signature == IMAGE_NT_SIGNATURE) size = (uintptr_t)nt->OptionalHeader.SizeOfImage;
+		    }
+		}
 		const uintptr_t end = base + size;
 
 		j["module_base"] = format_string("0x%llX", (unsigned long long)base);
@@ -2357,10 +2540,19 @@ namespace xmgr {
 			probe("exec",         (const void*)m_sqlite3Rountines->exec);
 			probe("step",         (const void*)m_sqlite3Rountines->step);
 			probe("finalize",     (const void*)m_sqlite3Rountines->finalize);
+			probe("db_mutex",   (const void*)m_sqlite3Rountines->db_mutex);
+			probe("mutex_enter",(const void*)m_sqlite3Rountines->mutex_enter);
+			probe("mutex_leave",(const void*)m_sqlite3Rountines->mutex_leave);
 		} else {
 			j["api_table_null"] = true;
 		}
 		j["slots"] = slots;
+		// sqlite 版本与线程模式（验证 api 表布局 / 连接是否 FULLMUTEX）
+		try {
+		    if (m_sqlite3Rountines->libversion) j["libversion"] = m_sqlite3Rountines->libversion();
+		    if (m_sqlite3Rountines->xthreadsafe) j["xthreadsafe"] = m_sqlite3Rountines->xthreadsafe();
+		    if (m_sqlite3Rountines->compileoption_used) j["threadsafe_opt"] = m_sqlite3Rountines->compileoption_used("THREADSAFE");
+		} catch (...) { j["sqlite_info_error"] = true; }
 
 		j["hooks_installed"] = {
 			{ "open_v2_code", db_registry::openHookInstalled() },

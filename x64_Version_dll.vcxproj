@@ -221,6 +221,7 @@
     <ClCompile Include="src\httplib_core.cpp" />
     <ClCompile Include="src\http_post.cpp" />
     <ClCompile Include="src\http_routes.cpp" />
+    <ClCompile Include="src\ilink_proxy.cpp" />
     <ClCompile Include="src\http_server.cpp" />
     <ClCompile Include="src\inline_weixin_dll_load.cpp" />
     <ClCompile Include="src\lz4.c" />

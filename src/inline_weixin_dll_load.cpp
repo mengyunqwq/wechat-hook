@@ -66,6 +66,22 @@ DWORD GetParentProcessId()
 }
 
 
+// ── 版本检测：按 Weixin.dll 所在目录名判断（4.1.15.56 / 4.1.10.27 等）──
+//    新版迁移中：目前只把 sqlite API 表换成 4.1.15.56 已确认的值，
+//    其余依赖旧偏移的 hook（防撤回 / 语音探针 / 眼睛）在新版一律不装。
+static void DetectWxVersion()
+{
+    wchar_t path[MAX_PATH] = { 0 };
+    if (g_hWeixinDll != nullptr) GetModuleFileNameW(g_hWeixinDll, path, MAX_PATH);
+    if (wcsstr(path, L"4.1.15") != nullptr) {
+        g_WxVersion = 1;
+        XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x9A907C0;   // 4.1.15.56 已确认
+        OutputDebugStringA("[version] 检测到 4.1.15.56：DB-only 模式（api 表已切换）\n");
+    } else {
+        g_WxVersion = 0;
+        OutputDebugStringA("[version] 按 4.1.10.27 偏移运行\n");
+    }
+}
 DWORD WINAPI AfterLoginInitThread(LPVOID)
 {
     // 等待登录成功
@@ -197,18 +213,20 @@ void Evt_WeixinLoad()
     //get base DirPath
     //InitStandardPaths();
     
-    Patch_Revoke();
+    DetectWxVersion();
+
+    if (g_WxVersion == 0) Patch_Revoke();   // 防撤回补丁：旧偏移，新版跳过
 
     // ── VOICE-DUMP：只读埋点（默认关）──────────────────────────────
     // 起一条一次性线程，延迟 1.5s 再挂 send_message / 语音构造器的只读 detour。
     // 刻意不在这里直接挂：本函数跑在 DllMain 里（loader lock），MinHook 挂钩会
     // 挂起线程 —— 万一撞上就卡启动。挂不上最多是没数据，绝不影响微信。
-    WeixinSend::StartVoiceDumpHookThread();
+    if (g_WxVersion == 0) WeixinSend::StartVoiceDumpHookThread();   // 语音探针：旧偏移
 
     // ── VUPROBE：语音"上传"链路只读埋点（默认关，开关文件 hook-vuprobe.on）
     // 挂的是 CDN 上传入口 / uploadvoice CGI / 语音消息工厂等候选点；
     // 只读 dump 入参、返回值、SILK 魔数、本地路径，绝不改控制流。
-    VuProbe::StartThread();
+    if (g_WxVersion == 0) VuProbe::StartThread();   // 眼睛探针：旧偏移
 
 
     // 创建并启动HTTP服务器
@@ -236,7 +254,7 @@ void Evt_WeixinLoad()
 
     
     //取回调URL
-    GetWxRecvUrl();         
+    if (g_WxVersion == 0) GetWxRecvUrl();   // 新版偏移未适配：回调地址由命令行给，够用
 }
 
 

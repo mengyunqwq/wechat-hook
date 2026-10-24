@@ -7,6 +7,8 @@
 #include "hideself.h"
 #include "global.h"
 
+void InitIlinkProxy(HMODULE self);   // ilink_wrapper 代理（4.1.15.56+ 注入点）
+
 int g_receive_type = 1;
 int g_StartPort = 30001;
 int g_MsgSendPort = 80;

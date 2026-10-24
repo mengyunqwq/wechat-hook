@@ -111,3 +111,36 @@ ETW（logman / Microsoft-Windows-Kernel-Process）抓 ImageLoad 需要管理员�
 
 适配 4.1.15.56 = **注入方案重做 + 偏移全套重逆**，工作量按周计，不是小时级。
 机器人继续跑 4.1.10.27（稳定）。
+## 注入点打通：ilink_wrapper 代理（2026-10-24 16:00）
+
+### 已验证
+
+```
+新版加载的是 4.1.15.56\ilink_wrapper.dll（版本目录，exe 目录无效）
+把原 DLL 改名 ilink_wrapper_orig.dll + 代理转发 8 个导出 → 微信能正常启动（5 进程）
+hook 逻辑已接入代理（InitIlinkProxy + CustomInit 起线程等 Weixin.dll）
+新版上 /QueryDB/status 能响应（HTTP 30001 起来）
+```
+
+### 仍然崩溃
+
+新版下两个 dump：
+
+```
+Weixin.dll+0x53B4FE4
+Weixin.dll+0x593AC51
+```
+
+不是旧版那个固定点，说明还有**旧偏移的探针/钩子**在新版被装到了错误地址。
+hook-probe.log 显示 `[probe] SQL 入口探针已就绪` 仍在装（SQL 入口探针用的是旧偏移）。
+
+### 待办（按顺序）
+
+1. 新版模式下禁用所有「只读探针」：SQL 入口探针、PUSH 线程、语音/眼睛（已部分跳过）
+2. 只保留 DB 层：open16/prepare/step/finalize（新 api 表槽位已知）
+3. 验证三库可读后再逐个恢复
+4. 另需适配：登录检测（g_IsLogin）、GetSelfProfile、发送/语音/图片
+
+### 现状
+
+机器人继续跑 4.1.10.27（稳定）；新版适配是长期任务。

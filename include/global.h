@@ -71,6 +71,9 @@ inline uint64_t g_xlogHookTarget = 0x108678;                     // xlog 钩子�
 inline uint64_t g_xwechatMainClazz = 0xA83AB20;                  // 主类对象地址
 
 
+// 微信版本：0 = 4.1.10.27（原始适配），1 = 4.1.15.56（迁移中）
+inline int g_WxVersion = 0;
+
 inline size_t XWECHAT_SQLITE3_VFS_OFFSET = 0xA6C0490;            // 可被 offset_resolver 覆盖
 inline size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x8BB0D38;   // 可被覆盖
 inline size_t XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET = 0x8BB1570; // 可被覆盖

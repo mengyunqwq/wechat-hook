@@ -274,14 +274,31 @@ void InitRealDll()
 /* =========================
    劫持入口（与 version 一致）
    ========================= */
+static DWORD WINAPI CustomInitThread(LPVOID)
+{
+    // 4.1.15.56+：本 DLL 从 Weixin.dll 的依赖（ilink_wrapper）里加载，
+    // 此时 Weixin.dll 还没完成映射 —— 等它就绪再初始化（最多 30 秒）。
+    for (int i = 0; i < 300; ++i)
+    {
+        if (GetModuleHandleW(L"Weixin.dll") != nullptr) break;
+        Sleep(100);
+    }
+    if (GetModuleHandleW(L"Weixin.dll") == nullptr)
+    {
+        OutputDebugStringA("[init] wait Weixin.dll timeout\n");
+        return 0;
+    }
+    if (MH_Initialize() != MH_OK) return 0;
+    Evt_WeixinLoad();
+    return 0;
+}
+
 void CustomInit(HMODULE hModule)
 {
     g_hWeixinExe = GetModuleHandleW(L"weixin.exe");
     if (!g_hWeixinExe)
         return;
 
-    if (MH_Initialize() != MH_OK)
-        return;
-
-    Evt_WeixinLoad();
+    // DllMain 里不能等/装钩子（loader lock）→ 起线程
+    CreateThread(nullptr, 0, CustomInitThread, nullptr, 0, nullptr);
 }

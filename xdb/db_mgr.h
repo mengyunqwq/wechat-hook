@@ -39,6 +39,8 @@ namespace xmgr {
         // POST /Debug/DBRescan {"force":true} → 触发一次取名扫描（**带 30 秒节流**，
         //                        节流窗口内直接返回"太快了"，不硬扫）。
         nlohmann::ordered_json dbRescanReport();
+        sqlite3* ownConnectionFor(sqlite3* clientDb);   // 自开只读连接的缓存（方案 A）
+        void forgetOwn(sqlite3* clientDb);              // 独立连接出错时丢弃它（回退客户端连接）
         nlohmann::ordered_json dbRescanForce();
         // GET /Debug/ApiTable → **纯只读**快照：sqlite3_api_routines 各关键槽位的地址、
         //                        是否落在 Weixin.dll 模块内、各 hook 是否已安装。
@@ -59,6 +61,8 @@ namespace xmgr {
         sqlite3CodecGetKey m_codecGetKey = nullptr;
         std::map<std::string, LPVOID> m_dbs;
         std::mutex m_searchDbMtx;
+        std::map<std::string, sqlite3*> m_ownDbs;   // path → 我们自己的只读连接
+        std::mutex m_ownMtx;
         std::vector<BYTE> m_backupAsmCode;
     };
 }
