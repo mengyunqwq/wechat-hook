@@ -1659,3 +1659,65 @@ hook 它并在客户端线程调用，让它自己构造 arg2（不用我们手�
 ✅ send_message 定位（0x19E5F00）+ 调用通路
 🟡 发消息（arg2 需真实结构，下一步用 create_param2）
 ```
+## send_message 完整参数结构（2026-10-25 02:20，成功抓到）
+
+### 原始 dump（BASE=0x7FFBA5960000）
+
+```
+arg1+000 88A0C4AEFB7F0000 D08654E8E8010000 E08654E8E8010000 E08654E8E8010000
+arg1+032 B08754E8E8010000
+
+arg2+000 608354E8E8010000 508354E8E8010000 AAAAAAAAAAAAAAAA AAAAAAAAAAAAAAAA
+arg2+064 AAAAD0C6CBE6E8010000 088E0CAFFB7F0000 605D7BE7E8010000
+arg2+096 60D42BE8E8010000 AAAAAAAAAAAAAAAA
+arg2+128 AAA00A09B0D92000000 688D0CAFFB7F0000 605D7BE7E8010000
+arg2+160 60D42BE8E8010000 0600000001000000 00000000AAAAAAAA
+arg2+192 AAAA40A09B0D92000000 B2060000 00000000 00000000
+
+arg2[0]->  一堆指针（0x1E8E825EB00 等）
+arg2[1]->  488087AEFB7F0000 0100000001000000 ...（vtable = base+0x8E18048?）
+data+000   506B76EBE8010000 406B76EBE8010000 4C000400E8010000 51C9874D00F00188
+msgBuf+000 B86A98AEFB7F0000 06000000 02000000 486B98AEFB7F0000 ...
+msgBuf+192 66696C6568656C706572（filehelper）
+```
+
+### 解析出的 RVA（稳定）
+
+| 项 | 运行地址 | RVA |
+|---|---|---|
+| param1_vtable（arg1[0]）| 0x7FFBAEC4A088 | **0x92EA088** |
+| 消息对象 vtable | 0x7FFBAE986AB8 | **0x9026AB8** |
+| 消息对象 vtable2 | 0x7FFBAE986B48 | **0x9026B48** |
+| arg2[9] 函数指针 | 0x7FFBAF0C8E08 | **0x768E08** |
+| arg2[17] 函数指针 | 0x7FFBAF0C8D68 | **0x768D68** |
+| arg2[1]->vtable | 0x7FFBAE878048 | **0x8E18048** |
+
+### arg2 结构（0xE8）
+
+```
+[0]  堆指针（含更多指针的结构）
+[1]  堆指针（vtable = base+0x8E18048 的结构）
+[2..7]  0xAAAAAAAA（未初始化填充）
+[8]  堆指针
+[9]  base + 0x768E08   ← 模块内函数
+[10] 堆指针
+[11] 堆指针
+[12..15] 0xAA
+[16] 堆指针（0x920D9BA000）
+[17] base + 0x768D68   ← 模块内函数
+[18] 堆指针
+[19] 堆指针
+[20] 0x0000000100000006  ← (type=1, msglen=6)
+[21..22] 0xAA
+[23] 堆指针（0x920D9BA040）
+[24] 0x6B2
+```
+
+### 结论
+
+arg2 是**由微信的 create_param2 构造的复杂结构**（多层堆指针 + 模块内函数指针）。
+手动重建不现实，**应定位 create_param2 并调用它**（旧版 0xDF40）。
+
+### 下一步
+
+用 Ghidra 或函数体匹配找 create_param2（新版），调用它构造 arg2。
