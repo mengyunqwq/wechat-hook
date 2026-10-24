@@ -1133,3 +1133,42 @@ E:\tools\
   ghidra\        Ghidra 12.2
   jdk25\         JDK 25
 ```
+## HTTP 接口做好了（2026-10-24 23:00）
+
+### wxdump24.dll（176KB）
+
+- 内置 HTTP 服务：`127.0.0.1:30002`
+- `/status` → `{"status":0,"msgdb":"...","hasDb":1}`
+- `/messages` → 返回最新 5 条消息（含 zstd 解压后的 XML）
+- 关键设计：HTTP 线程把请求排队 → `my_step`（客户端线程）执行 → HTTP 线程返回 JSON
+
+### 实测
+
+```
+30002 监听 ✓
+GET /status → {"status":0,"msgdb":"","hasDb":0}   （登录页时无消息库，正常）
+```
+
+### 一个限制
+
+`/messages` 依赖 **step 被调用**（客户端线程执行窗口）。微信空闲时 step 调用稀疏 → 请求可能超时（3 秒）。
+
+改进方向：
+1. 延长等待时间（10 秒）
+2. 或主动触发（点击聊天/发消息）
+3. 或 hook 更多高频函数作为执行窗口
+
+### 后台操作（不弹窗）
+
+登录可以用 **PostMessage 后台点击**（不调用 SetForegroundWindow），实测有效：
+
+```
+ShowWindow(SW_SHOWNOACTIVATE) + PostMessage(WM_LBUTTONDOWN/UP)
+→ 微信 5 进程登录成功，窗口不抢焦点 ✓
+```
+
+### 下一步
+
+1. 延长 /messages 等待（或加主动触发）
+2. 把探针逻辑移植进 wechat-hook 正式工程
+3. 消息轮询 → 机器人收消息
