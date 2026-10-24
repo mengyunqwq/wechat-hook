@@ -831,3 +831,41 @@ api 表 = base + 0x9A907C0（#76 open / #77 open16 / #100 step / #143 open_v2）
 全程在**客户端线程**、用**客户端连接**、不跨线程、不改表 —— 安全。
 
 这是新版读库最可行的路径。
+## 🎉 突破：新版读库链路打通（2026-10-24 20:05）
+
+### 方案：在 step hook 里用客户端连接执行自己的 SQL
+
+`wxdump18.cpp`：
+1. 手动 trampoline hook `sqlite3_step`（RVA 0x5927600，函数头只有 push/sub，安全）
+2. 第一次 step 调用时（客户端线程）：
+   - `db = *(void**)stmt`（stmt 偏移 0 = db ✓ 已验证）
+   - `api->prepare(#78)(db, "SELECT count(*) FROM sqlite_master", -1, &stmt2, 0)`
+   - `((step_fn)tramp)(stmt2)` —— 走 trampoline，不触发我们的 hook，无递归
+   - `api->column_int(#28)(stmt2, 0)` 读值
+   - `api->finalize(#63)(stmt2)`
+3. 再调原 step
+
+### 实测日志
+
+```
+STEP first: stmt=000002E8A14DA070 db=000002E8A13C5BD0
+QUERY rc=100 text=count(*) int=1
+```
+
+- `rc=100` = SQLITE_ROW（查询成功）
+- `int=1` = column_int 读到了值（这个 db 只有 1 张表）
+- prepare / step / column_int / finalize **全部工作**
+
+### 为什么这个方案可行
+
+- 客户端线程（hook 在微信自己的线程里）
+- 客户端连接（用传进来的 db，不跨线程）
+- 不改表、不新建连接、不需要密钥
+- 我们的查询走 trampoline（原函数），不递归
+
+### 下一步
+
+1. 用 `api->db_filename(#192)` 拿库名，按库名查（message_1.db / contact.db）
+2. 缓存 db 句柄（多个库）
+3. 把查询结果通过 HTTP 接口暴露（/QueryDB）
+4. 再接消息轮询
