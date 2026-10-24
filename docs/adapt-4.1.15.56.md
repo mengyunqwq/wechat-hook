@@ -2412,3 +2412,70 @@ msgBuf 的结构比旧版复杂：
 ✅ 完整 msgBuf/uuid/结构 dump
 🟡 程序化发消息（差 content 指针的最后定位）
 ```
+## 直接调 send_message 也崩：最终结论（2026-10-25 08:00）
+
+### 测试
+
+```
+wxdump36（不 hook，HTTP /send 直接调 send_message）：
+  msgBuf = 从 msgbuf.bin 模板复制（1864 字节）
+  arg1 = 按结构构造（param1_vtable + data）
+  arg2 = 全零 0xE8
+
+结果：
+  第 1 次：send_message returned OK，进程存活（暂时）
+  第 2 次：返回 OK，但随后微信崩溃（17:41:45 新 dump）
+```
+
+### 根因
+
+**send_message 需要完整的 arg2 结构**（含 4 个子堆指针 + 模块内函数指针）。
+零块 arg2 → 微信处理时解引用空指针 → 崩溃。
+
+### 为什么无法解决
+
+1. arg2 的构造依赖 `create_param2`（旧版 0xDF40，新版找不到）
+2. 手动重建 arg2 需要：
+   - 4 个子堆的完整内容（dump 过部分）
+   - 模块内函数指针（RVA 已知：0x768E08 / 0x768D68）
+   - 正确的初始化序列（未知）
+3. 每次测试都会崩（微信进安全模式，恢复成本高）
+
+### 最终结论（诚实）
+
+**在当前条件下，程序化发消息不可行。**
+
+不是"再挖一层"的问题，而是：
+- send_message 的 arg2 是微信内部构造的复杂对象
+- 没有 create_param2 就无法正确构造
+- 每次尝试崩溃一次（微信风控 + 恢复成本）
+
+### 已确认可行的替代方案
+
+```
+✅ 读库：HTTP /messages（202ms，完整 XML）
+✅ 发消息：UI 自动化（PostMessage 点击+输入+回车，已验证可发）
+```
+
+### 本次适配的总成果
+
+```
+✅ 新版注入（ilink 代理 + 延迟 core）
+✅ HTTP 服务 30002（/status /messages）
+✅ 登录（PostMessage 后台，不弹窗）
+✅ 读库（枚举/消息行/column_text#42/zstd 解压）
+✅ 发消息（UI 自动化）
+✅ 15 层发送调用链（完整记录）
+✅ 全部关键 RVA 与 api 槽位表
+✅ 逆向方法论（函数体匹配/trampoline/客户端线程执行）
+🟡 程序化发消息：确认不可行（arg2 依赖 create_param2，找不到）
+```
+
+### 给未来的接手者
+
+如果将来有 IDA Pro + 充足时间：
+1. 用 IDA 全量分析 0x3DE9600 业务层（Ghidra 反编译超时）
+2. 找到 create_param2（arg2 构造函数）
+3. 调用它构造 arg2 → 直接调 send_message
+
+文档中包含所有中间数据和探针源码（wxdump18~36）。
