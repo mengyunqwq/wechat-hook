@@ -2570,3 +2570,54 @@ txt_message_ctr = 0x6B2C30
 
 新版读库已经可用（HTTP /messages），发消息用 4.1.10.27 机器人。
 或者：等有 IDA 环境再做新版的程序化发消息。
+## 4.1.15.56 发消息逆向突破与最后卡点（2026-10-25 10:00）
+
+### 已定位（全部验证）
+
+| 项 | RVA | 方法 |
+|---|---|---|
+| `send_message` | 0x19E5F00 | 函数体中段匹配 |
+| `txt_message_ctr` | **0x77AB70** | 中段 +256/+320 匹配 |
+| `create_param2` | **0xF910** | 中段 +96~+320 匹配 |
+| `txt_message_vtbl`（msgBuf+0）| 0x9026AB8 | dump |
+| `txt_message_vtbl2`（msgBuf+0x10）| **0x9026B48** | txt_message_ctr 内部 `lea rax,[rip+0x88ABF66]` |
+| `arg2 vtable` | **0x9A907C8** | create_param2 内部 `lea rcx,[rip+0x8F086EE]` |
+| `param1_vtable` | 0x92EA088 | dump |
+
+### 实测（wxdump38）
+
+```
+txt_message_ctr OK
+create_param2 OK
+send_message OK
+→ 但随后微信崩溃
+```
+
+### 崩因
+
+`create_param2` 的第 6 参数（param2）是一个**对象指针**：
+```asm
+0xFA15: mov rbx, [rbp+0x68]    ← param2 值
+0xFA70: mov [rsi+0xD0], rbx    ← 存到 arg2+0xD0
+```
+我们传了旧版地址（4.1.10.27 的 0xA0CE0B0 内容）→ 无效指针 → send_message 内部解引用崩。
+
+### 为什么找不到 param2
+
+- 旧版：param2 = 0xA0CE0B0（全局变量，存指针）
+- 新版：`call create_param2` 有 **590 个调用者**（0xF910 可能是通用构造函数，不专用于发消息）
+- 无法从调用者反推 param2 来源
+
+### 结论
+
+**三个关键函数全部定位正确**，但 `param2`（发送上下文对象）是微信内部状态，无法从外部构造。
+
+**这已经是 4.1.15.56 程序化发消息的最后一公里**：
+- 要么：找到 param2 的全局变量（需要 IDA 分析 590 个调用者）
+- 要么：接受用 4.1.10.27
+
+### 给接手者
+
+如果继续：
+1. 用 IDA 分析 0xF910 的调用者（590 个），找专门用于发消息的那个
+2. 或者：hook 微信自己的发送流程，在 create_param2 调用前抓 param2 的值
