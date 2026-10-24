@@ -2210,3 +2210,55 @@ msgBuf（0x748 全部 dump 了）
 
 - 完整 dump：`D:\wxhook\wx4156\4.1.15.56\wxdump.log`（1570 行）
 - 探针源码：`wxdump31.cpp`
+## 借道发消息（A 方案）首次测试（2026-10-25 05:40）
+
+### 实现
+
+`wxdump32.dll`：
+- hook send_message（trampoline）
+- 读 `send.txt`（格式 `target|text`）
+- 在 hook 里改写 msgBuf：receiver（+0xB0 in msg）、content（+0x708）、type、msg_len
+- 调用原函数发出去
+
+### 测试结果
+
+```
+创建 send.txt = "filehelper|hello from hook"
+UI 触发一次发送（发 "x"）
+日志：REWRITE ok target=filehelper text=hello from hook
+send.txt 被删除（读取后删）
+```
+
+**改写逻辑执行成功** ✓
+
+### 但
+
+```
+随后微信进程退出（0 进程），无新崩溃 dump
+```
+
+### 分析
+
+改写可能破坏了结构细节：
+- receiver/content 的 WeixinString 布局（inline vs heap）
+- msg_len 偏移（我们用的 +0x188）
+- 或者：改写后微信的后续处理（序列化/网络）遇到无效数据
+
+### 下一步
+
+对照 dump 的真实值修正：
+```
+msgBuf+0xC0 = "filehelper"（receiver inline）
+msgBuf+0xD0 = 0x0A（length）
+msgBuf+0xD8 = 0x0F（cap）
+msgBuf+0x718 = content（需要确认 dump 里这个位置的值）
+msgBuf+0x198 = msg_len（需要确认）
+```
+
+用 dump 数据逐字节对照，修正偏移。
+
+### 数据资产
+
+- 完整对象图 dump：1570 行（wxdump31 产出）
+- 借道探针：wxdump32.cpp
+- 关键 RVA：send_message 0x19E5F00
