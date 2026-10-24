@@ -2304,3 +2304,58 @@ content   +0x708 (= msgBuf+0x718)         ✗ 不是文本
 探针 wxdump33.cpp（只 dump 关键字段），wxdump31.cpp（全量 dump 但被截断）。
 
 **下一步**：改进 wxdump31（dump 完整 0x748 且确保日志不截断），然后搜消息文本定位 content。
+## msgbuf.bin 二进制分析（2026-10-25 06:30）
+
+### 文件
+
+`D:\wxhook\wx4156\4.1.15.56\msgbuf.bin`（1864 字节 = 0x748，完整）
+
+### 关键区段
+
+```
++0x000  vtable(0x7FFBAE986AB8) + 06000000 02000000
++0x010  vtable2(0x7FFBAE986B48) + 堆指针(0x22F59582C20)
++0x020  堆指针(0x22F59582C10)
++0x040  0F（cap）
++0x060  0F
++0x080  0F
++0x0A0  0F ... 01000000（+0xAC = 1 ← 用户发的 "1" 的 length！）
++0x0B4  07000000（cap=7）
++0x0C0  "filehelper"（receiver）+ 0A(length) + 0F(cap)
++0x700  0F（cap）
++0x708  堆指针(0x22F57C44260)
++0x718  0x24（36）
++0x720  0x2F（47）
++0x740  0F
+```
+
+### 新发现
+
+1. **+0xAC = 1** → 这是某 WeixinString 的 length（用户发的 "1"）
+2. **+0xB4 = 7** → 可能是 cap
+3. **+0x708 是堆指针**（content 的 heap_buf，指向堆上的字符串）
+4. **+0x718/0x720 = 36/47** → 可能是另一个字符串的 length/cap
+
+### 推断
+
+新版 TextMessage 的 content 结构：
+```
+某个偏移：inline_buf[16] + length(+0x10) + cap(+0x18)
+如果 length 在 +0xAC，则 inline_buf 在 +0x9C（不对齐）
+如果 cap 在 +0xB4，则 length 在 +0xAC，inline_buf 在 +0x94
+```
+
+需要更多对照（发不同的字符串，看长度/内容怎么变）。
+
+### 下一步
+
+1. 发一条长消息（如 20 字符）→ 对比 length/cap 变化
+2. 或者：从 +0x708 的堆指针读堆内容（content 实际文本）
+
+### 当前状态
+
+```
+✅ msgbuf.bin 导出（完整 0x748）
+✅ receiver 偏移确认（+0xC0）
+🟡 content/type/msg_len 偏移待最终确认
+```
