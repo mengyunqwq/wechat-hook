@@ -795,3 +795,39 @@ powershell -ExecutionPolicy Bypass -File D:\微信deepseek\scripts\wechat-power.
 codec_get_key (4.1.15.56) = base + 0x57B94A0   ← 关键成果
 api 表 = base + 0x9A907C0（#76 open / #77 open16 / #100 step / #143 open_v2）
 ```
+## 重要纠错：codec_get_key 定位从一开始就是错的（2026-10-24 19:40）
+
+### 证据
+
+反汇编旧版 `0x4EE64D0` 与新版匹配到的 `0x57B94A0`，**两处是同一段代码**：
+
+```asm
+0x4EE64C0: lea ebx, [rbx + rbx*4]     ; base32 编码循环
+0x4EE64C3: neg r11d
+0x4EE64C6: add r11d, r8d
+0x4EE64C9: add r11d, 0x23
+0x4EE64CD: movzx r11d, byte ptr [r11 + rax]
+0x4EE64D2: mov byte ptr [rdx + 1], r11b
+```
+
+这是 **base32 编码函数**，不是 codec_get_key。
+
+### 结论
+
+`g_pat_4` 特征码匹配的是 base32 编码函数（新版 198 处命中，说明它根本不独特）。
+所谓「96 字节唯一命中」只是匹配到了这个函数体，**不是 codec_get_key**。
+
+**因此旧版 `tryCaptureKey` 抓到的"密钥"很可能一直是无效的**，旧版读库实际走的是客户端连接（不是独立连接 + 密钥）。
+
+### 但这带来一个更好的方案
+
+**不需要密钥**：在 `step` 的 hook 里（客户端线程）：
+1. 用 `api->prepare`（#78）准备我们自己的 SELECT
+2. 用 **trampoline（原 step）** 执行 —— 不经过 hook，无递归
+3. 用 `api->column_text`（#36）读结果
+4. `api->finalize`（#63）释放
+5. 再调原 step（传进来的 stmt）
+
+全程在**客户端线程**、用**客户端连接**、不跨线程、不改表 —— 安全。
+
+这是新版读库最可行的路径。
