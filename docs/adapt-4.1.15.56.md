@@ -541,3 +541,40 @@ sqlite：  0x5926DC0 / 0x5928186 / 0x593CBFB / 0x594B279
 1. 定性 0x3FF 区域 / 0xD8C8DC（扫字符串）
 2. 找到「发送消息」业务函数（很可能在 0x3FF 或 0xD8 段）
 3. 从该函数反推：它是否调用 WCDB 插入 + 网络发送
+## 顺序化栈：拿到 32 层完整链（2026-10-24 16:05）
+
+`wxdump7` 改为按「首次出现顺序」输出（#00 = 最内层 step 调用者，编号越大越外层）。
+
+一次发消息的完整链（36 个）节选：
+
+```
+#00 0x71D52CA    #01 0x61149E (Qt)   #02 0x363DFA0 (WCDB)
+#03 0x611B06 (Qt) #04 0x612A40 (Qt)   #05 0x360BF8A (WCDB)
+#06 0x5928186 (sqlite)  ...
+#11 0x1491E3D (WCDB SQL) #12 0x234C084 (WCDB ORM)
+#13 0x149C161 (WCDB)     #14 0x274DF77 (联系人 schema)
+#15 0x13003C    #16 0x10B6B3F   #17 0x69AF27
+#18 0x754CEAC   #19 0x76DBCAD   #20 0x117FE1
+#21 0x7550683   #22 0x10B0655   #23 0x1699136
+#24-26 0x570xxxx  #27 0x12E52F0  #28 0x3BC89D
+#29 0x1690487    #30 0x570455C  #31 0x34FAAC0
+```
+
+### 区域定性（新增）
+
+| 区域 | 字符串特征 | 定性 |
+|---|---|---|
+| `0x234Cxxx` | "Can not read sql" / "AUTOINCREMENT" / "Auto add column" | WCDB ORM 层 |
+| `0x274Dxxx` | contact / chat_room / chatroom_member / name2id / biz_info | **联系人 DB schema** |
+| `0x3FFxxxx` | chat_cell_avater_size / file_list_cell_* | Qt 聊天界面布局 |
+| `0xD8xxxx` | QMargins / gpu_control / GetFileVersionInfo | Qt/工具层 |
+
+### 仍未定位
+
+「发送消息」业务层。已知它在这条链的 #12~#23 之间某处（既不是 Qt、也不是 WCDB），
+候选地址：`0x13003C / 0x10B6B3F / 0x69AF27 / 0x76DBCAD / 0x117FE1 / 0x1699136 / 0x570xxxx / 0x12E52F0 / 0x3BC89D / 0x1690487 / 0x34FAAC0`
+
+### 备注
+
+整个 DLL 里**没有** "message_0/message_1/message.db" 这类字符串（库名是拼接的），
+所以不能用库名做锚点。
