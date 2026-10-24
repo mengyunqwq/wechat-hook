@@ -2996,3 +2996,44 @@ send.txt (target|text) + 触发（PostMessage 或用户发一条）
 - `wxdump51.cpp`（整合版，读库+发消息）
 - `minhook/`（MinHook 源码）
 - zstd（E:\tools\zstd-1.5.7）
+## 🎉 联系人接口成功！（2026-10-25 18:47）
+
+### wxdump54
+
+```
+HTTP 30007 /contacts → 1191 字节，真实联系人
+包含：服务通知/微信团队/朋友推荐/语音记事本/梦云/蓝色大肥鱼/腾讯新闻/文件传输助手/群（@chatroom）等
+```
+
+### 关键技术
+
+```
+1. step hook（手写 trampoline）记录所有 db（g_seen[32]）
+2. 遍历 g_seen 找含 contact 表的 db
+3. SELECT username,nick_name FROM contact LIMIT 50
+4. 返回 JSON
+```
+
+### 当前三探针
+
+| 功能 | 探针 | 端口 |
+|---|---|---|
+| 读库 | wxdump51 | 30006 /messages |
+| 发消息 | wxdump46/51 | send.txt + MinHook |
+| 联系人 | wxdump54 | 30007 /contacts |
+
+### 下一步（整合）
+
+```
+把 /messages + /contacts + 发消息 整合到一个探针（单端口）
+```
+
+### 与旧版对比
+
+| 功能 | 旧版 | 新版 |
+|---|---|---|
+| 读库 | QueryDB | ✅ /messages |
+| 发消息 | SendTextMsg | ✅ 借道 |
+| 联系人 | （读库）| ✅ /contacts |
+| 群成员 | （读库）| 🟡 可做（chatroom_member）|
+| 图片/语音 | ✅ | ❌ 待逆向 |
