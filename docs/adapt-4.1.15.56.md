@@ -3177,3 +3177,37 @@ send_message... DIRECT SEND OK!!!
 
 - `wxdump62.cpp`（缓存 param2 + 直接发）
 - 端口 30011
+## 直接发（param2 缓存）：日志 OK 但崩溃（2026-10-25 19:50）
+
+### 实测
+
+```
+param2 cached: 0x664BCFA2F8
+txt_message_ctr OK
+create_param2 with cached param2... OK
+send_message... DIRECT SEND OK!!!   ← 函数返回了
+→ 但微信随后崩溃，实际没发出
+```
+
+### 教训
+
+```
+「函数返回 OK」≠「发送成功」
+param2 对象本身（堆）有效，但它的成员指针（数据库连接等）可能失效
+→ send_message 内部处理时崩
+```
+
+### 最终结论（修正）
+
+```
+❌ 直接发（param2 缓存）—— 假成功（崩溃）
+✅ 借道（hook 改写 + 触发）—— 真成功（已验证）
+```
+
+### 当前唯一可靠的方案
+
+```
+借道：hook send_message，改 msgBuf 的 content/receiver/atlist
+     + PostMessage 自动触发（程序自动）
+= 真·程序化（文字/@/群已验证）
+```
