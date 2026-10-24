@@ -2525,3 +2525,48 @@ snapshot.bin：未生成
 3. 理解 arg2 的生命周期（何时有效）
 
 **没有这些，所有尝试都会崩**——这不是努力问题，是逆向深度问题。
+## 参考仓库分析（2026-10-25 09:00）
+
+### 克隆了 mosheng20205/WechatHook4.1.10.27
+
+它的 `SendText` 实现（src/wx_send.cpp L501）与我们完全相同：
+```cpp
+msgBuf = HeapAlloc(0x768);
+BuildTextMessage(msgBuf, msg, wxidorgid);
+data[0] = msgBuf + 2; data[1] = msgBuf;
+arg1[0] = base + offset::param1_vtable; ...
+arg2 = HeapAlloc(0xE8); BuildSendParam2_Text(arg2);
+send_message(arg1, arg2);
+```
+
+它的 offset 定义（include/global.h）：
+```
+create_param2  = 0xDF40
+param1_vtable  = 0x84EC9C8
+param2         = 0xA0CE0B0
+param2_1       = 0x8595F58
+param2_2       = 0x8595E98
+param2_3       = 0x8595DD8
+txt_message_ctr = 0x6B2C30
+```
+
+### 尝试 vtable 内容匹配（失败）
+
+读旧版 param1_vtable 的条目（RVA: 0x16778E0 / 0xA820 / 0x1677A30），
+在新版搜对应值 → 0 命中（因为新版函数 RVA 全变了）。
+
+### 结论
+
+1. 参考仓库的实现在 4.1.10.27 完整可用（有全部 RVA）
+2. 4.1.15.56 缺 create_param2/param2（特征匹配失败、vtable 内容匹配失败）
+3. **我们的机器人用 4.1.10.27 已经能发消息**（完整功能）
+
+### 两条路
+
+**A. 继续用 4.1.10.27**（机器人现有，功能完整）—— 零成本
+**B. 新版 4.1.15.56 继续逆向**（需 IDA + 数小时，不确定）—— 高成本
+
+### 建议
+
+新版读库已经可用（HTTP /messages），发消息用 4.1.10.27 机器人。
+或者：等有 IDA 环境再做新版的程序化发消息。
