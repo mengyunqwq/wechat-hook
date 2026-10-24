@@ -144,3 +144,38 @@ hook-probe.log 显示 `[probe] SQL 入口探针已就绪` 仍在装（SQL 入口
 ### 现状
 
 机器人继续跑 4.1.10.27（稳定）；新版适配是长期任务。
+## 转向 WCDB 层（2026-10-24 晚）
+
+### 新版 sqlite 的结论
+
+- 新版只有 **一套** sqlite（`3.27.2` 字符串只出现 1 次）
+- 没有 SQLite API-armor 的特征字符串（"API call with"、"misuse at line" 均无）
+- 但任何「改 api 表 / MinHook 挂钩 / 提前触碰」都会让客户端崩 → 微信在 sqlite 层有自己的保护
+
+### WCDB 痕迹（新版 Weixin.dll）
+
+```
+"WCDB" 字符串         file 0x91ED85C
+"wcdb_one_or_binary"  file 0x91ED85C 附近
+"wcdb_builtin_compression_record" file 0x9186BF8
+"Init BaseStorage"    file 0x9186BF8 附近
+Name2Id / sqlite_master / chunksizeconfig 等表名
+getHandle 字符串       file 0xB3FF5A9
+```
+
+没有 `WCDB::` 的 C++ 符号（Release 剥了 RTTI）。
+
+### 已定位的 WCDB 锚点（xref）
+
+| 字符串 | 被引用位置（VA） |
+|---|---|
+| "Init BaseStorage" | 0x180FDFC3E |
+| "wcdb_builtin_compression_record" | 0x1814B85AE |
+| "WCDB" | 0x181486026 |
+
+下一步：从 `0x180FDFC3E` 所在函数（WCDB 初始化）往下走，找「数据库句柄获取 / SQL 执行」的封装入口，
+从 WCDB 层借道读库，绕开 sqlite 表。
+
+### 现状
+
+机器人继续跑 4.1.10.27；新版适配作为独立项目继续。
