@@ -1768,3 +1768,43 @@ D:\微信deepseek\data\wxdump\wxdump18~28.cpp  ← 各阶段探针源码
 E:\tools\zstd-1.5.7\      ← zstd 库
 E:\tools\ghidra / jdk25   ← 逆向环境
 ```
+## create_param2 最后的尝试与结论（2026-10-25 03:00）
+
+### 尝试
+
+1. 扫描 `mov ecx, 0xE8`（分配 arg2 大小）→ 10 个候选
+2. 扫描引用 arg2[9]/[17]（0x768E08 / 0x768D68）→ **0 处命中**
+3. 扫描引用 arg2[1]->vtable（0x8E18048）→ **0 处命中**
+
+### 结论
+
+`create_param2` 的定位需要 **IDA/Ghidra 全量分析**（几小时的人工判断），
+脚本级方法已经到极限。
+
+### 现实建议：发消息用 UI 自动化
+
+**已经验证可行**：我们那次用 PostMessage 点击 + WM_CHAR 输入 + 回车，
+真的发出去了（"abc123"），触发了 send_message（探针抓到了完整 dump）。
+
+所以「发消息」功能可以这样实现：
+```
+PostMessage 点击聊天列表项 → 点输入框 → WM_CHAR 输入 → 回车
+```
+虽然不优雅，但**可用**，而且不依赖 create_param2。
+
+### 最终状态
+
+```
+✅ 注入 / HTTP / 登录（后台）
+✅ 读库（枚举/消息行/zstd 解压）
+✅ HTTP /status /messages（202ms 真实数据）
+✅ send_message 定位 + 完整参数结构
+✅ 发消息可用（UI 自动化，已验证）
+🟡 程序化发消息（差 create_param2，需 IDA 级分析）
+```
+
+### 建议的收尾
+
+1. 把探针（wxdump24/27）的逻辑移植进 wechat-hook 正式工程
+2. 发消息用 UI 自动化（已有可用代码）
+3. create_param2 留给将来（有 IDA 时）
