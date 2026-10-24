@@ -1273,3 +1273,49 @@ mov rdi, rcx
 1. 从旧版代码看 send_message 的调用约定（参数结构）
 2. 在新版按同样方式调用（构造 TextRequest）
 3. 验证能否发出一条文字
+## 发消息的实现路径（旧版已验证，新版需重定位偏移）
+
+### 旧版 SendText（src/wx_send.cpp L1411）
+
+```cpp
+// 1. 构造 TextMessage 对象（0x768 字节）
+uint64_t* msgBuf = HeapAlloc(0x768);
+BuildTextMessage(msgBuf, msg, wxidorgid, atlist);
+
+// 2. 构造 data（0x20）
+data[0] = msgBuf + 2;
+data[1] = msgBuf;
+data[2] = 0;
+
+// 3. 构造 arg1（0x28）：vtable + data
+arg1[0] = base + offset::param1_vtable;   // ★ 需要新版 offset
+arg1[1] = data;
+arg1[2] = data + 0x10;
+arg1[3] = data + 0x10;
+arg1[4] = 1;
+
+// 4. 构造 arg2（0xE8）：发送参数
+BuildSendParam2_Text(arg2);               // ★ 内部依赖 param2_* 偏移
+
+// 5. 调用
+((WeixinCall)(base + offset::send_message))(arg1, arg2);   // ★ send_message = 0x19E5F00（已定位）
+```
+
+### 新版需要的偏移（当前状态）
+
+| 偏移 | 用途 | 状态 |
+|---|---|---|
+| `send_message` | 发送入口 | ✅ 0x19E5F00 |
+| `param1_vtable` | arg1 的 vtable | ⬜ 需定位（旧版 g_pat_8）|
+| `param2` / `param2_1..3` | arg2 构造 | ⬜ 需定位（旧版 g_pat_9~12）|
+| `BuildTextMessage` | 消息对象构造 | ⬜ 需定位（可能在 send_message 附近）|
+
+### 下一步（两条路）
+
+**A. 特征匹配法**（快）：
+- 用旧版 g_pat_8（param1_vtable）等特征扫新版
+- 逐个定位
+
+**B. 学习法**（稳）：
+- hook send_message（0x19E5F00），dump 用户手动发消息时的 arg1/arg2 内存
+- 分析真实结构后模仿
