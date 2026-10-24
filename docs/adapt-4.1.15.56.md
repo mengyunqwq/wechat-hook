@@ -1808,3 +1808,52 @@ PostMessage 点击聊天列表项 → 点输入框 → WM_CHAR 输入 → 回车
 1. 把探针（wxdump24/27）的逻辑移植进 wechat-hook 正式工程
 2. 发消息用 UI 自动化（已有可用代码）
 3. create_param2 留给将来（有 IDA 时）
+## 🎯 找到发消息业务层（2026-10-25 03:30）
+
+### 抓到完整调用栈（38 层）
+
+```
+BT[00] 0x7FFC41F012BF (outside, kernel32?)
+BT[01] WX+0x19E567C     ← send_message 内部
+BT[02] WX+0x19E51BD     ← send_message 内部
+BT[03] WX+0x3DE9B07     ← ★ 调用方（业务层）
+BT[04] WX+0x3DE8311
+BT[05] WX+0x3DE66CC
+BT[06] WX+0x3DE5EE9
+BT[07] WX+0x3DE3B8F
+BT[08] WX+0x1C11232
+BT[09] WX+0x2A19C4
+BT[10] WX+0x1E78706
+BT[11] WX+0x5CCB3D
+BT[12] WX+0x6B4440
+BT[13] WX+0x6B75C6
+...
+BT[23] WX+0x1675B3
+BT[25] WX+0x153D47D
+```
+
+### 反汇编 BT[03] 附近（关键）
+
+```
+0x3DE9AF4: lea r8, [rbp - 8]
+0x3DE9AF8: lea r9, [rbp + 0xa0]
+0x3DE9AFF: mov rcx, rdi
+0x3DE9B02: call 0x19E5060      ← ★ 调用的是 0x19E5060（send_message 的包装）
+0x3DE9B07: nop
+```
+
+### 结论
+
+```
+0x3DE9600（业务层，大函数）→ call 0x19E5060（发送包装，4 参数）→ send_message(0x19E5F00)
+```
+
+**两个关键新地址**：
+- **0x19E5060** = 发送包装函数（4 参数，比 send_message 更上层）
+- **0x3DE9600** = 业务层（发消息的完整流程）
+
+### 下一步
+
+1. hook `0x19E5060`（4 参数）→ 抓参数结构（比 send_message 简单）
+2. 或反编译 `0x3DE9600` → 看参数（wxid/content）
+3. 找到"接收 wxid + text"的那一层 → 直接调用它就是 hook 式发消息
