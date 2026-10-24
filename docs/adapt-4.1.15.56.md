@@ -1721,3 +1721,50 @@ arg2 是**由微信的 create_param2 构造的复杂结构**（多层堆指针 +
 ### 下一步
 
 用 Ghidra 或函数体匹配找 create_param2（新版），调用它构造 arg2。
+## create_param2 定位尝试（2026-10-25 02:35）
+
+### 尝试：用 arg2[1]->vtable（0x8E18048）反查构造函数
+
+扫描 .text 中引用该 vtable 的 lea 指令 → **0 处命中**（vtable 可能通过 mov 或数据表引用）。
+
+### 现实评估
+
+发消息走到最后一步：
+- ✅ send_message 可调用
+- ✅ 参数结构完全 dump（6 个 RVA）
+- ❌ create_param2（arg2 构造）定位困难（特征失效 + vtable 引用找不到）
+
+### 三条收尾方案
+
+**A. 硬编码重建 arg2**（从 dump 抄）
+   - arg2 的 6 个稳定 RVA 已知
+   - 但 arg2[0]/[1] 指向的子堆只 dump 了 0x80，需要再抓更深
+   - 风险：漏指针 → 崩溃（已验证零块会崩）
+
+**B. UI 自动化发消息**（绕过逆向）
+   - PostMessage 点击 + WM_CHAR 输入 + 回车
+   - 已验证能发（"abc123" 那次的 dump 说明消息真的发出去了 → 触发了 send_message）
+   - 缺点：依赖窗口状态，不稳定
+
+**C. 继续逆向 create_param2**
+   - 用 Ghidra 全量分析（慢）或 mov 引用扫描
+   - 成本高
+
+### 本次会话最终状态
+
+```
+✅ 注入 / HTTP / 登录（后台）
+✅ 读库（枚举/消息行/zstd 解压）
+✅ HTTP /status /messages（202ms 真实数据）
+✅ send_message 定位 + 参数结构（6 RVA）
+🟡 发消息：差 arg2 构造（create_param2）
+```
+
+### 关键资产（全部在仓库）
+
+```
+docs/adapt-4.1.15.56.md   ← 完整记录
+D:\微信deepseek\data\wxdump\wxdump18~28.cpp  ← 各阶段探针源码
+E:\tools\zstd-1.5.7\      ← zstd 库
+E:\tools\ghidra / jdk25   ← 逆向环境
+```
