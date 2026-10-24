@@ -1231,3 +1231,45 @@ Start-Process -WindowStyle Minimized
 
 1. 桥（wx-bridge）接入 `/messages` → 机器人能收消息
 2. 发消息（hook send_message）
+## 🎉 send_message 定位成功（2026-10-24 23:55）
+
+### 方法：旧版函数体中段精确匹配
+
+取旧版 `send_message`(RVA 0x1677A30) 函数体 +64 / +192 / +320 / +448 处的 64 字节，
+逐个在新版里精确匹配：
+
+```
++64  → 4 处命中：0x19E5F40 / 0x19E6FF0 / 0x19E7AF0
++192 → 4 处命中（同上，偏移 +0x80）
++320 → 4 处命中
++448 → 4 处命中
+```
+
+### 函数序言完全一致
+
+新版 `0x19E5F00` / `0x19E6FB0` 的序言：
+
+```asm
+push rbp
+push r14
+push rsi
+push rdi
+push rbx
+sub rsp, 0x1e0
+lea rbp, [rsp + 0x80]
+mov qword ptr [rbp + 0x158], 0xfffffffffffffffe
+mov rbx, rdx
+mov rdi, rcx
+```
+
+与旧版 `send_message`(0x1677A30) 的序言**完全一致**（`55 41 56 56 57 53 48 81 EC E0 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 58 01 00 00 FE FF FF FF`）。
+
+### 结论
+
+**新版 send_message = RVA 0x19E5F00**（另有副本 0x19E6FB0）
+
+### 下一步
+
+1. 从旧版代码看 send_message 的调用约定（参数结构）
+2. 在新版按同样方式调用（构造 TextRequest）
+3. 验证能否发出一条文字
