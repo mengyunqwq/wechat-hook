@@ -685,3 +685,40 @@ Ghidra 脚本              E:\tools\gh_scripts\decompile_at.java / func_of_ret.j
 部署位置                 D:\wxhook\wx4156\4.1.15.56\wxdump.dll（由 ilink 代理加载）
 触发开关                 D:\wxhook\wx4156\4.1.15.56\record.on
 ```
+## 会话阶段性总结（2026-10-24 17:15）
+
+### 新版（4.1.15.56）适配到什么程度
+
+| 能力 | 状态 |
+|---|---|
+| 注入（ilink_wrapper 代理 + 延迟加载 core） | ✅ 完成 |
+| HTTP 服务（30001，/QueryDB/status 等）| ✅ 稳定 |
+| 登录 | ✅ 正常 |
+| 读库（sqlite） | ❌ 未完成 |
+| 发消息 | ❌ 未完成 |
+| 探针工具链（抓调用栈） | ✅ 完成（wxdump5-11 六代）|
+| Ghidra 反编译 | ✅ 可用（JDK 25 环境已配好）|
+
+### 读库为什么没完成
+
+1. 改 api 表 → 微信校验崩溃
+2. MinHook 挂错地址 → 崩；挂对地址（手动 trampoline）→ 可触发
+3. 需要定位「发消息」业务函数，但：
+   - 调用栈能抓到（132 帧 × 30 块）
+   - 但业务层与框架层混杂，函数起点识别不准（Ghidra 反编译失败率高）
+
+### 下一步（如果继续）
+
+```
+A. 修 Ghidra 函数起点识别（用 x64dbg 的调用栈视图，人工确认起点）
+B. 找 WCDB 的 execute 接口（0x1480000-0x14C0000 区域），从我们线程调用
+C. 保持 4.1.10.27 不动
+```
+
+### 机器人
+
+机器人未启动（按用户要求，专心搞新版）。恢复命令：
+
+```
+powershell -ExecutionPolicy Bypass -File D:\微信deepseek\scripts\wechat-power.ps1 -Action start
+```
