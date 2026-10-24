@@ -1172,3 +1172,62 @@ ShowWindow(SW_SHOWNOACTIVATE) + PostMessage(WM_LBUTTONDOWN/UP)
 1. 延长 /messages 等待（或加主动触发）
 2. 把探针逻辑移植进 wechat-hook 正式工程
 3. 消息轮询 → 机器人收消息
+## 🎉🎉🎉 HTTP 接口完全打通（2026-10-24 23:40）
+
+### 实测（微信 4.1.15.56，后台运行不弹窗）
+
+```
+GET http://127.0.0.1:30002/messages
+耗时 202ms，返回 5780 字节：
+
+{"status":0,"data":[{"row":["80","1436035038","1","1792819454000","1",
+ "1792819454","3","0","0","0","2",null,
+ "<?xml version=\"1.0\"?>\n<mmreader>\n <category type=\"20\" ...>
+   <name><![CDATA[腾讯新闻]]></name>
+   <topnew><cover><![CDATA[https://inews.gtimg.com/...]]></cover>
+   ...
+```
+
+- `status=0` ✓
+- 消息字段完整（localId/msgSvrId/type/createTime）✓
+- **col12 = 解压后的完整 XML**（zstd 解压成功）✓
+
+### 接口清单
+
+| 接口 | 说明 |
+|---|---|
+| `GET /status` | `{"status":0,"msgdb":"Msg_xxx","hasDb":1}` |
+| `GET /messages` | 最新 5 条消息，含解压后的 XML |
+
+### 关键实现
+
+1. HTTP 线程（30002）接收请求 → 排队
+2. `my_step`（客户端线程）处理请求
+3. **遍历所有缓存的 db 找含 Msg_ 表的库**（解决 db 失效问题）
+4. zstd 解压 col12 → XML
+5. 返回 JSON
+
+### 后台运行（不弹窗）
+
+```
+Start-Process -WindowStyle Minimized
++ ShowWindow(SW_SHOWNOACTIVATE) + PostMessage 点击
+→ 登录成功，窗口不进前台
+```
+
+### 新版适配完成度
+
+```
+✅ 注入 / HTTP / 登录（后台）
+✅ 枚举库表 / 识别消息库
+✅ 读消息（字段 + zstd 解压后的 XML）
+✅ HTTP 接口（/status /messages）
+
+⬜ 消息轮询（桥接入）
+⬜ 发消息
+```
+
+### 下一步
+
+1. 桥（wx-bridge）接入 `/messages` → 机器人能收消息
+2. 发消息（hook send_message）
