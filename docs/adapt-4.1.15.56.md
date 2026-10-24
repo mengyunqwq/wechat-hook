@@ -3125,3 +3125,55 @@ DLL 在微信进程内 → MinHook hook send_message → 改写 msgBuf → 调�
 PostMessage 自动触发（点输入框 + 输入 + 回车）
 = 程序自己完成（不需要用户手动发）
 ```
+## 🎉🎉🎉 直接发（无触发）突破！2026-10-25 19:45
+
+### 关键发现
+
+```
+param2 = 0x19E5060 的第1参数 = 会话数据库对象（堆，长期有效）
+→ 可以缓存！
+→ 用它调 create_param2 + send_message → 成功
+```
+
+### 实测（wxdump62）
+
+```
+param2 cached: 0x664BCFA2F8
+txt_message_ctr OK
+create_param2 with cached param2... OK
+send_message... DIRECT SEND OK!!!
+微信 5 进程（没崩！）
+```
+
+### 实现（wxdump62）
+
+```
+1. MinHook hook 0x19E5060（发送包装，5 参数）
+2. 第一次调用时缓存 p1（= param2，会话数据库对象）
+3. HTTP /send：
+   a. 构造 msgBuf（0x7B0，txt_message_ctr 初始化）
+   b. 构造 data/arg1
+   c. create_param2(arg2, p2, p3, p4, buf, 缓存的 param2)
+   d. send_message(arg1, arg2)
+= 完全直接发（无触发！）
+```
+
+### 为什么这次成功
+
+```
+之前失败：以为 param2 是栈对象（失效）
+真相：param2 是会话数据库对象（堆，微信运行期间长期存活）
+→ 缓存后一直有效 → 直接发可行！
+```
+
+### 与借道对比
+
+| 方式 | 触发 | 状态 |
+|---|---|---|
+| 借道 | 需要（用户发消息）| ✅ |
+| **直接发** | **不需要** | **✅（本次突破）** |
+
+### 探针
+
+- `wxdump62.cpp`（缓存 param2 + 直接发）
+- 端口 30011
