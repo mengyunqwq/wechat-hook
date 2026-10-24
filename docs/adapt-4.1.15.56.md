@@ -361,3 +361,31 @@ headless  = E:\tools\ghidra\ghidra_12.2_PUBLIC\support\analyzeHeadless.bat
 项目      = E:\tools\gh_proj  （程序 /Weixin.dll，noanalysis）
 脚本目录  = E:\tools\gh_scripts
 ```
+## 调用栈逐层分析结果（2026-10-24 15:00）
+
+反汇编 5 个返回地址的调用点，结论：
+
+| 返回地址 | 所在函数 | 分析结论 |
+|---|---|---|
+| 0x4DC7DFB | 0x4DC7D90（429B）| 网络发送封装，含 `WSAGetLastError`，调 `ws2_32!send` |
+| 0x4E7CD51 | 0x4E7CA6A 附近 | 虚函数调用（`call rax`，rax=[rdi]+0x60），附近字符串 `"net_stat_ is empty"` → 网络统计/上报 |
+| 0x4E83297 | — | 大对象虚调用（参数含 `[rsi+0x1318]`）→ 网络管理器层 |
+| 0x66C04CB | **0x66C04A0**（可靠）| 小 thunk：`sub rsp,0x38; lea r9,[rcx+0x38]; ...` |
+| 0x121D26 | **0x121D10**（可靠）| 析构函数：`call 0x121D40; call [rax+8]; call 0x121F60` |
+
+**关键结论：这条调用栈是「发送完成后的清理/统计路径」，不是消息构造路径。**
+单次 send 断点抓不到业务层，因为业务层（构造 TextRequest）在更深/更早的调用中。
+
+### 下一步方案（需要动态调试器交互）
+
+要用 x64dbg 在「消息发送」时中断并**向上回溯完整调用栈**（x64dbg 的 Call Stack 窗口直接显示函数名+起始 RVA），再对起点用 Ghidra 反编译。
+
+x64dbg 已装：`E:\tools\x64dbg\release\x64\x64dbg.exe`
+- 附加 wx4156 的 Weixin.exe
+- 断点：`bp ws2_32.send` 或 `bp ws2_32.WSASend`
+- 发消息 → 看 Call Stack 窗口（会自动解析出每个函数的起始 RVA）
+- 记录业务层函数 RVA → Ghidra 反编译
+
+### 当前状态
+
+机器人已恢复 4.1.10.27（5 进程、登录、30 表、查询正常）。
