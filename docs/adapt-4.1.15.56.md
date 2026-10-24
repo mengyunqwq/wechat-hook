@@ -3037,3 +3037,48 @@ HTTP 30007 /contacts → 1191 字节，真实联系人
 | 联系人 | （读库）| ✅ /contacts |
 | 群成员 | （读库）| 🟡 可做（chatroom_member）|
 | 图片/语音 | ✅ | ❌ 待逆向 |
+## 🎉 @（艾特）成功！（2026-10-25 18:52）
+
+### 实测
+
+截图：群「呆子梦云粉丝团（13）」出现 **"@梦云 测试艾特"**
+日志：`ATLIST written` + `REWRITE target=47390425951@chatroom text=@梦云 测试艾特`
+
+### 实现（wxdump55）
+
+```
+content (msgBuf+0x768) = "@梦云 测试艾特"        ← 显示层
+atlist  (msgBuf+0x788) = wxid_urirqbcdh0rc22     ← 提醒层（梦云 wxid）
+```
+
+### atlist 偏移（从 txt_message_ctr 初始化推导）
+
+```
+inline_buf = msgBuf+0x788
+length     = msgBuf+0x798
+cap        = msgBuf+0x7A0
+```
+
+### 验证状态
+
+```
+✅ 显示层：已确认（截图）
+🟡 提醒层：atlist 已写入，需对方确认红点
+```
+
+### send.txt 协议（扩展）
+
+```
+target|text           ← 普通消息
+target|text|atwxid    ← @消息（atwxid = 被 @ 人）
+```
+
+### 当前能力总览（新版 4.1.15.56）
+
+| 功能 | 状态 | 探针 |
+|---|---|---|
+| 读库 | ✅ /messages | wxdump51 |
+| 发消息 | ✅ 借道 | wxdump46/51 |
+| 发群消息 | ✅（@chatroom）| wxdump55 |
+| @（艾特）| ✅ 显示+atlist | wxdump55 |
+| 联系人 | ✅ /contacts | wxdump54 |
