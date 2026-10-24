@@ -52,3 +52,27 @@
 - 结构体布局没变（sqlite 版本相同）是最大的好消息：**DB 层可以先跑通**
 - 发送/语音/眼睛仍需逐个逆，预计 **1~3 天**
 - 在完成前，机器人继续用 4.1.10.27（当前稳定）
+
+## 进展：SQLCipher 表 / 密钥函数（2026-10-24 追加）
+
+- `sqlcipher_api_routines` 只有 9 个字段（register_provider / get_provider / key / key_v2 /
+  rekey / rekey_v2 / register_custom_provider / unregister_custom_provider / get_fallback_provider）
+- 用「9 连 .text 指针」在 .rdata 扫候选：**命中 10 万+**（vtable 区太多），无法唯一定位
+- 已知 sqlcipher 相关字符串都在（`cipher_store_pass` @ file 0x9A8D038、`sqlcipher_export` @ 0x9A8D5A3），
+  但 `lea rax,[rip+d]` 形式的 xref 没找到（引用寄存器不一定是 rax，需要更宽的 xref 扫描）
+
+### 策略调整
+
+**先不追密钥/独立连接**，因为：
+
+1. 独立只读连接（A 方案）要 `codec_get_key`，它是 sqlcipher 内部函数，定位难度高
+2. 4.1.10.27 上「借用客户端连接 + 全局串行化」虽然理论上有并发风险，但实测能长期工作
+3. 把目标拆成两步：**先让新版能读库/收消息**（借用连接），再单独攻独立连接
+
+### 阶段 2 计划（新版能读库）
+
+1. 偏移可配置：`XWECHAT_SQLITE3_API_ROUTINES_OFFSET` 支持运行时覆盖（已有），加一份 4.1.15.56 的值
+2. 用一个「仅 DB 层」的构建：只装 open16/prepare/step/finalize（新表槽位已知），
+   其余用旧偏移的 hook（发送、语音、眼睛、登录监视、xlog）全部 **条件编译关掉**
+3. 在新客户端上验证：`/QueryDB/status` + `/QueryDB/execute` 三库可读
+4. 通过后再逐个恢复：发送 → 语音 → 图片 → 眼睛
