@@ -1393,3 +1393,57 @@ send_message(arg1, arg2);         // ← 新版 0x19E5F00（已定位）
 - `send_message` hook 已生效（抓到了 1 次真实调用，msgBuf 里有 "filehelper"）
 - 最近一次测试 UI 点击没对上，没触发（窗口坐标问题）
 - 待办：修 UI 自动化 + 完整解析 arg1/arg2（格式化已修好：%08X%08X）
+## 新版适配总览（2026-10-25 00:45 收尾）
+
+### 关键数据（全部实测）
+
+```
+Weixin.dll 4.1.15.56:
+  api 表           = base + 0x9A907C0
+  send_message     = base + 0x19E5F00   （另一副本 0x19E6FB0）
+  注入点           = <版本目录>\ilink_wrapper.dll（代理 + 延迟加载 core）
+
+sqlite api 槽位（规律：标准索引 + 6）:
+  step #100 / prepare #78 / finalize #63
+  column_text #42 / column_blob #25 / column_bytes #26
+  column_int #28
+  （db_filename #192 会崩，不用；sql #161 返回 NULL）
+```
+
+### 已完成（可用）
+
+| 能力 | 实现 | 状态 |
+|---|---|---|
+| 注入 | ilink_wrapper 代理 + 延迟加载 | ✅ 稳定 |
+| HTTP | 127.0.0.1:30002 | ✅ |
+| 登录 | PostMessage 后台点击（不弹窗）| ✅ |
+| 枚举库表 | step hook + prepare/step/column_text | ✅ |
+| 识别消息库 | Msg_* 表 | ✅ |
+| 读消息行 | column_blob #25 + column_bytes #26 | ✅ |
+| zstd 解压 | 集成 zstd 1.5.7 | ✅ |
+| HTTP 接口 | /status /messages | ✅ 202ms 返回完整 XML |
+
+### 部分完成
+
+| 能力 | 已做 | 差 |
+|---|---|---|
+| 发消息 | send_message 定位（0x19E5F00）+ 真实调用抓取（msgBuf 布局、filehelper）| arg1[0]（param1_vtable）与 arg2 完整值 |
+
+### 未开始
+
+```
+图片 / 语音 / 眼睛 / 联系人 / 群成员
+```
+
+### 经验（跨版本可复用）
+
+1. **函数定位**：旧版函数体中段 64 字节在新版精确匹配（send_message、codec 都靠这个）
+2. **api 表槽位**：+6 偏移（column_text 是 #42 不是 #36）
+3. **hook 方式**：手动 trampoline（复制 12 字节 + jmp 回），函数头只有 push/sub 时安全
+4. **读库路径**：step hook 里用客户端连接执行自己的 SQL（不跨线程、不改表）
+5. **UI 自动化**：PostMessage + ShowWindow(NOACTIVATE) 不弹窗
+
+### 待续
+
+1. 发消息：从真实调用 dump 抄 param1_vtable + arg2 结构
+2. 图片/语音/眼睛：同旧版特征或函数体匹配
