@@ -1605,3 +1605,57 @@ struct TextMessage {           // 从 msgBuf+0x10 开始
 **B. Ghidra 反编译**：在新版找 create_param2（可能需要局部反编译 + 人工判断）。
 
 先试 A（快）。
+## 发消息首次尝试结果（2026-10-25 02:00）
+
+### 做法
+
+`wxdump27.dll` = wxdump24（HTTP+读库）+ `/send` 接口：
+```
+构造 msgBuf（按 TextMessage 结构手填）
+→ data → arg1（param1_vtable = 0x92EA088）
+→ arg2 = 全零 0xE8
+→ 调 send_message(base + 0x19E5F00)
+```
+
+### 结果
+
+```
+GET /send → {"status":0,"desc":"sending"}{"status":0,"desc":"sent"}
+```
+
+- send_message 被成功调用（返回了）
+- **但随后微信崩溃**（日志显示探针重启了一次，第二次没有 MSGDB）
+
+### 结论
+
+**send_message 调用本身没问题**（没在调用点崩），但 **arg2 全零不行**——微信处理 arg2 时解引用了空指针。
+
+### 下一步
+
+arg2 必须用真实结构（从之前的 dump 抄）：
+```
+arg2[0]  = 0x18A13534D60   (堆指针)
+arg2[1]  = 0x18A13534D50   (堆指针)
+arg2[8]  = 0x18A13CEEFE0
+arg2[9]  = base + 0x6C8E08   (模块内)
+arg2[10] = 0x18A104322 60
+arg2[17] = base + 0x6C8D68
+arg2[20] = 0x0000000100000003
+arg2[23] = 0x729DB39BF0
+arg2[24] = 0x684
+```
+其中堆指针指向的子结构还需要 dump（CreateParam2 的产物）。
+
+### 更可靠的下一步
+
+**B 方案**：hook `create_param2`（旧版 0xDF40 对应函数）——它是"构造 arg2"的函数，
+hook 它并在客户端线程调用，让它自己构造 arg2（不用我们手拼）。
+
+### 会话总成果
+
+```
+✅ 注入 / HTTP / 登录
+✅ 读库（含 zstd 解压）→ /messages 202ms 返回完整 XML
+✅ send_message 定位（0x19E5F00）+ 调用通路
+🟡 发消息（arg2 需真实结构，下一步用 create_param2）
+```
