@@ -649,3 +649,39 @@ api 表 #161 槽（sqlite3_sql）返回 NULL → 拿不到 SQL 文本
 0x3FA8E1 / 0x3FA8D0 / 0x3FA890 / 0x691D24 / 0x47BABE
 0x2296BF / 0xD8946A / 0xD8C8DC / 0xD8D64B / 0x4A11FE / 0x3E1FC / 0x4A3F2F
 ```
+## Qt 栈过滤探针成功（2026-10-24 17:05）
+
+`wxdump11.cpp`：手动 trampoline hook step，只在「栈里含 Qt UI 层地址（0x6000000-0x7000000）」时记录。
+
+结果：**30 个块，每块 132~137 帧**（完整调用链）。
+
+### 固定调用链（出现在 26~29/30 块）
+
+```
+0x76DBCAD (29/30)
+0x570EFD7 / 0x570455C / 0x570404E / 0x570BCBD / 0x570D8C9   (0x570xxxx)
+0x6A16248 / 0x6A165F7                                        (0x6A1xxxx)
+0x34FAAC0 / 0x37D44A6 / 0x3BC89D
+```
+
+这些是「用户操作 → DB 写入」的**框架层**（任务调度/消息队列），不是发送业务层。
+
+### 结论与转向
+
+继续在 sqlite 层下钻，区分「发消息」与「其他 DB 写」的成本太高。
+
+**建议改为「调用微信自己的 WCDB API」**：
+- 0x1480000-0x14C0000 是 WCDB 库（字符串 "WCDB.Operation"）
+- 找到 WCDB 的「执行 SQL」接口（接收字符串参数）→ 从我们的线程调用
+- 不需要 hook sqlite，也不需要改表 → 最可能绕过保护
+
+### 工具链现状（可直接复用）
+
+```
+Ghidra 12.2 + JDK 25     E:\tools\ghidra / E:\tools\jdk25
+Ghidra 脚本              E:\tools\gh_scripts\decompile_at.java / func_of_ret.java
+探针源码                 D:\微信deepseek\data\wxdump\wxdump5..11.cpp
+手动 trampoline 版       wxdump10/11（已验证 hook 生效）
+部署位置                 D:\wxhook\wx4156\4.1.15.56\wxdump.dll（由 ilink 代理加载）
+触发开关                 D:\wxhook\wx4156\4.1.15.56\record.on
+```
