@@ -490,3 +490,26 @@ sqlite：  0x5926DC0 / 0x5928186 / 0x593CBFB / 0x594B279
 
 微信 4.1.15.56 正在运行（带 step 探针，未登录状态可随时点「进入微信」）。
 机器人未启动（按用户要求，优先搞新版）。
+## 区域定性：step 栈抓到的其实都是 WCDB（2026-10-24 15:45）
+
+扫描两段区域的字符串引用，确认：
+
+| 区域 | 字符串特征 | 定性 |
+|---|---|---|
+| `0x1480000-0x14C0000` | `wcdb_one_or_binary` / `WCDB.Operation` / `com.Tencent.WCDB.Config.*` / "Backup can't be run in transaction" | **WCDB 库** |
+| `0x35B0000-0x3640000` | `Unpaired lock` / `Checkpoint-%p` / WAL / `PRAGMA cipher_compatibility` / fts3/fts5 | **WCDB 锁/检查点/加密层** |
+
+也就是说 step 探针抓到的：
+```
+0x1491E18 / 0x1493788  → WCDB 的 SQL 执行层
+0x35BD067 / 0x3602220  → WCDB 的 DB 封装层
+0x5928186 / 0x593CBFB  → sqlite 内核
+```
+**都不是微信的业务层（消息发送）**——业务层在更上层，但被 32KB 栈扫描范围截断了。
+
+### 下一步
+
+把 `wxdump7.cpp` 的栈扫描范围从 `0x8000` 放大到 `0x40000`（256KB），重新抓一次，
+应该能看到「业务层 → WCDB → sqlite」的完整链条，才能定位发送入口。
+
+（机器人未启动，微信 4.1.15.56 在跑，随时可测。）
