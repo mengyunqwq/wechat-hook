@@ -267,6 +267,46 @@ private:
         g_lastRegMs.store(nowMs(), std::memory_order_relaxed);
     }
 
+    // ── 新版（4.1.15+）专用：只读扫描（不改代码/不改表）────────────────
+    //   用 vfs_find(NULL) 拿默认 VFS，再扫本进程内存找"第一个字段 == VFS"的对象
+    //   （sqlite3 结构体偏移 0 就是 pVfs），用 db_filename（自身带 SEH）只读验证名字。
+    // 独立 SEH 包装（函数内无析构对象，MSVC 才允许 __try）
+    inline sqlite3_vfs* vfsFindSafe(sqlite3_api_routines* api) {
+        __try { return api->vfs_find(nullptr); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+
+    inline int scanByVfs(sqlite3_api_routines* api) {
+        if (api == nullptr || api->vfs_find == nullptr || api->db_filename == nullptr) return 0;
+        sqlite3_vfs* vfs = nullptr;
+        vfs = vfsFindSafe(api);
+        if (vfs == nullptr) return 0;
+
+        int added = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        unsigned char* addr = nullptr;
+        while (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            const DWORD prot = mbi.Protect;
+            const bool readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable && mbi.RegionSize <= (64ull << 20)) {
+                unsigned char* p = (unsigned char*)mbi.BaseAddress;
+                unsigned char* end = p + mbi.RegionSize;
+                for (; p + 8 <= end; p += 8) {
+                    if (*(uintptr_t*)p == (uintptr_t)vfs) {
+                        std::string nm;
+                        if (safeDbName((void*)p, nm) && !nm.empty() && looksLikeDbName(baseName(nm))) {
+                            noteOpened((void*)p, nm);
+                            added++;
+                        }
+                    }
+                }
+            }
+            addr = (unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+            if (addr == nullptr) break;
+        }
+        return added;
+    }
+
+
     // 取名扫描的成果回填（src=2）。只给**已登记**的句柄补名字，绝不新造句柄。
     inline void noteNamed(void* db, const std::string& name) {
         const uintptr_t p = (uintptr_t)db;
@@ -1571,6 +1611,9 @@ private:
     //  这里用一次 relaxed 原子读把它挡在门外。
     // ══════════════════════════════════════════════════════════════════
     int detourPrepare(sqlite3* db, const char* sql, int n, sqlite3_stmt** stmt, const char** tail) {
+        if (g_WxVersion != 0) {   // 新版二分：只透传，不登记、不探针
+            return g_origPrepare ? g_origPrepare(db, sql, n, stmt, tail) : 1;
+        }
         // SEH 兜底：万一还有漏网的野指针，在这里变成 SQLITE_MISUSE 而不是崩掉客户端。
         // 注意 __try 里不能有带析构的 C++ 对象，所以只放一次函数调用。
         int rc = SQLITE_MISUSE;
@@ -2502,6 +2545,10 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 	// ── POST /Debug/DBRescan {"force":true}：触发一次取名扫描 ───────────
 	// 带 30 秒节流：节流窗口内返回"太快了"而不是硬扫。
 	nlohmann::ordered_json DatabaseMgr::dbRescanForce() {
+		if (g_WxVersion != 0) {
+		    const int scanned = db_registry::scanByVfs(m_sqlite3Rountines);
+		    OutputDebugStringA((std::string("[db_registry][new] VFS 扫描登记 ") + std::to_string(scanned) + " 个\n").c_str());
+		}
 		const int added = namePass();
 		nlohmann::ordered_json j;
 		if (added < 0) {
