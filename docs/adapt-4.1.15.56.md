@@ -2674,3 +2674,68 @@ send_message OK
 **用 4.1.10.27 机器人**（发消息完整可用，就是注入式 hook）。
 
 新版 4.1.15.56 的成果是**读库**（HTTP /messages，202ms 真实数据）——已完全可用。
+## 修正 msgBuf 后仍然崩——param2 是死结（2026-10-25 11:00）
+
+### wxdump39（修正版）
+
+```
+msgBuf = 0x7B0（不是 0x768）
+content = msg+0x758（txt_message_ctr 初始化确认）
+receiver = msg+0xB0
+```
+
+### 结果
+
+```
+txt_message_ctr OK
+create_param2 OK
+send_message OK
+→ 之后微信崩溃
+```
+
+### 最终死结：param2
+
+```
+param2 = 0x19E5060 的第1参数
+      = 业务层（0x3DE9600）的栈变量 [rbp+0x38]
+      = 发送上下文对象（业务函数内临时构造）
+```
+
+- 栈对象 → 函数返回失效 → 无法缓存
+- 业务层构造逻辑 → 需要完整复刻（成本极高）
+- 传 0 或旧版地址 → 必崩
+
+### 完整技术清单（4.1.15.56，全部已验证）
+
+```
+send_message       = 0x19E5F00
+txt_message_ctr    = 0x77AB70
+create_param2      = 0xF910
+txt_message_vtbl   = 0x9026AB8   (msgBuf+0)
+txt_message_vtbl2  = 0x9026B48   (msgBuf+0x10, txt_message_ctr 内 lea)
+arg2 vtable        = 0x9A907C8   (create_param2 内 lea)
+param1_vtable      = 0x92EA088
+msgBuf 大小        = 0x7B0（不是 0x748）
+content 偏移       = msg+0x758 = msgBuf+0x768
+receiver 偏移      = msg+0xB0 = msgBuf+0xC0
+type 偏移          = msg+0xD8
+msg_len 偏移       = msg+0x188
+param2             = 业务层栈对象（无法外部构造）
+```
+
+### 结论
+
+**4.1.15.56 程序化发消息在「纯外部注入」下不可行**——
+所有函数和结构都对，但 param2 是业务层的运行时上下文对象。
+
+### 能达到效果的办法（最终）
+
+1. **用 4.1.10.27 机器人**（现成，注入式，完整功能）✅
+2. **wechatauto-replica**（UIA 驱动，程序化 API，4.1.15.53 适配）🟡
+3. **hook 借道**（用户发消息时替换）：需在 arg1 的 msgBuf 改写，但 content 偏移已确认（msg+0x758），可试
+
+### 这次逆向的真实价值
+
+- 完整摸清了 4.1.15.56 的发送链路（15 层调用栈 + 所有函数 RVA）
+- 读库能力完全可用（HTTP /messages）
+- 所有数据和代码都记录在仓库，将来有 IDA 可继续
