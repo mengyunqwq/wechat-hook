@@ -277,28 +277,28 @@ private:
     }
 
     inline int scanByVfs(sqlite3_api_routines* api) {
-        if (api == nullptr || api->vfs_find == nullptr || api->db_filename == nullptr) return 0;
-        sqlite3_vfs* vfs = nullptr;
-        vfs = vfsFindSafe(api);
-        g_lastVfs.store((uintptr_t)vfs);
-        if (vfs == nullptr) return 0;
-
+        if (api == nullptr || api->db_filename == nullptr) return 0;
         int added = 0;
         MEMORY_BASIC_INFORMATION mbi;
         unsigned char* addr = nullptr;
         while (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            const DWORD prot = mbi.Protect;
-            const bool readable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
-            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable && mbi.RegionSize <= (64ull << 20)) {
-                unsigned char* p = (unsigned char*)mbi.BaseAddress;
-                unsigned char* end = p + mbi.RegionSize;
-                for (; p + 8 <= end; p += 8) {
-                    if (*(uintptr_t*)p == (uintptr_t)vfs) {
-                        std::string nm;
-                        if (safeDbName((void*)p, nm) && !nm.empty() && looksLikeDbName(baseName(nm))) {
-                            noteOpened((void*)p, nm);
-                            added++;
-                        }
+            const DWORD pr = mbi.Protect;
+            const bool rd = (pr & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && rd && mbi.RegionSize <= (64ull << 20)) {
+                unsigned char* q = (unsigned char*)mbi.BaseAddress;
+                unsigned char* qe = q + mbi.RegionSize;
+                for (; q + 8 <= qe; q += 8) {
+                    void* pvfs = *(void**)q;
+                    if (pvfs == nullptr || !IsReadableRegion(pvfs, 32)) continue;
+                    const int iVer = *(int*)pvfs;
+                    if (iVer < 1 || iVer > 3) continue;
+                    const char* nm = *(const char**)((unsigned char*)pvfs + 24);
+                    if (nm == nullptr || !IsReadableRegion(nm, 5)) continue;
+                    if (strncmp(nm, "win32", 5) != 0 && strncmp(nm, "unix", 4) != 0 && strncmp(nm, "wcdb", 4) != 0) continue;
+                    std::string name;
+                    if (safeDbName((void*)q, name) && !name.empty() && looksLikeDbName(baseName(name))) {
+                        noteOpened((void*)q, name);
+                        added++;
                     }
                 }
             }
@@ -306,6 +306,11 @@ private:
             if (addr == nullptr) break;
         }
         return added;
+    }
+
+    // SEH 包装（自身无析构对象）：扫描中任何访问违例变成 -1，不让异常冒出
+    inline int scanByVfsSafe(sqlite3_api_routines* api) {
+        __try { return scanByVfs(api); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     }
 
 
@@ -2551,7 +2556,7 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 	// 带 30 秒节流：节流窗口内返回"太快了"而不是硬扫。
 	nlohmann::ordered_json DatabaseMgr::dbRescanForce() {
 		if (g_WxVersion != 0) {
-		    const int scanned = db_registry::scanByVfs(m_sqlite3Rountines);
+		    const int scanned = db_registry::scanByVfsSafe(m_sqlite3Rountines);
 		    OutputDebugStringA((std::string("[db_registry][new] VFS 扫描登记 ") + std::to_string(scanned) + " 个\n").c_str());
 		}
 		const int added = namePass();
