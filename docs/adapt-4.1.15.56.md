@@ -753,3 +753,45 @@ powershell -ExecutionPolicy Bypass -File D:\微信deepseek\scripts\wechat-power.
 ### 环境清理
 
 微信已停止，探针已移除（wxdump.dll.off），机器人可用 wechat-power.ps1 启动。
+## 重大进展：codec_get_key 定位成功（2026-10-24 19:10）
+
+### 方法：跨版本函数体精确匹配
+
+用旧版 4.1.10.27 的 `codec_get_key`(RVA 0x4EE64D0) 前 96~384 字节，
+在新版 4.1.15.56 里做精确匹配：
+
+```
+96 字节  → 1 处命中
+128 字节 → 1 处命中
+384 字节 → 1 处命中
+结果：新版 codec_get_key = RVA 0x57B94A0
+```
+
+这说明 **SQLCipher 的 codec_get_key 函数在两个版本里编译结果完全一致**（唯一命中）。
+
+### 同时也确认
+
+- `g_pat_3`（sqlcipher api routines，含绝对地址）→ 新版 0 命中（预期）
+- `g_pat_4`（codec_get_key 内部特征）→ 新版 198 命中（不够独特）
+
+### 卡在最后一步
+
+尝试在 `sqlite3_step` hook 里调用 `codec_get_key(db, 0, &key, &len)` 抓密钥 → **崩溃**。
+
+可能原因：
+1. `stmt->db` 偏移不对（3.27 结构假设）
+2. codec_get_key 需要特定的 db 上下文状态
+3. 跨线程/锁问题
+
+### 下一步（如果继续）
+
+1. 验证 stmt->db 偏移（用旧版 4.1.10.27 的已知结构对照）
+2. 改用 open_v2 hook + 更早时机（微信启动时数据库已打开，需在代理加载前 hook）
+3. 或从内存扫描找 db 句柄（pVfs 特征）
+
+### 已有资产
+
+```
+codec_get_key (4.1.15.56) = base + 0x57B94A0   ← 关键成果
+api 表 = base + 0x9A907C0（#76 open / #77 open16 / #100 step / #143 open_v2）
+```
