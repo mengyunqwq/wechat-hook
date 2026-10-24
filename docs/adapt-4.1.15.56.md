@@ -1990,3 +1990,71 @@ BT[25] 0x153D47D
   消息对象 vtable   0x9026AB8
   api 表            0x9A907C0
 ```
+## 继续深挖的结果与最终判断（2026-10-25 04:20）
+
+### 0x3DE3B00（BT[08] 调用的函数）
+
+```asm
+mov rax, [rcx+0x10]      ← 对象成员
+test rax, rax
+je ...
+cmp [rax+0x2a0], 0       ← 检查某个状态位（网络/登录）
+je ...
+mov esi, edx             ← arg2（int）
+mov rdi, rcx             ← arg1（对象）
+mov [rbp-8], r8          ← arg3（结构）
+call 0x3DE3CB0           ← 更核心的发送函数
+```
+
+### 0x3DE5D90（BT[07] 调用的函数）
+
+```asm
+mov r15, r9
+mov rsi, r8
+mov rdi, rcx
+movabs rax, 0xaaaaaaaaaaaaaaaa   ← 初始化标记
+...
+```
+
+### 判断
+
+微信的发消息是**纯对象方法模式**（this + 多层结构），没有 (wxid, text) 这类简单接口。
+
+继续往下挖的边际收益极低：
+- 每层都是"对象 + 结构体"
+- 需要完整模拟对象图（this 指针、vtable、状态位）
+- 任何一层错就崩
+
+### 唯一可行的程序化方案（成本高）
+
+**hook 0x3DE3B00，在 hook 里"借道"发消息**：
+- 当微信自己发消息时（用户操作），我们的 detour 被调用
+- 在 detour 里构造我们的消息（改写参数）
+- 缺点：需要用户先发一条（不是完全主动）
+
+### 最终结论
+
+```
+读库（收消息）：✅ HTTP /messages，202ms，完全可用
+发消息：✅ UI 自动化（PostMessage），已验证可发
+程序化发消息：🟡 需要 IDA 全量分析 + 对象图重建，成本远超收益
+```
+
+### 建议（最终）
+
+1. 把 wxdump24 的读库逻辑移植进 wechat-hook 正式工程
+2. 发消息用 UI 自动化（代码已有）
+3. 程序化发消息留档，等有 IDA 环境时再攻
+
+### 会话总成果
+
+```
+✅ 注入（ilink_wrapper 代理 + 延迟 core）
+✅ HTTP（30002）/status /messages
+✅ 登录（PostMessage 后台，不弹窗）
+✅ 读库（枚举/消息行/column_text#42/zstd 解压）
+✅ 发消息（UI 自动化，已验证）
+✅ 15 层发送调用链全解析
+✅ 关键 RVA 表 + api 槽位表（+6 偏移规律）
+✅ 完整逆向方法论（函数体匹配、trampoline hook、客户端线程执行 SQL）
+```
