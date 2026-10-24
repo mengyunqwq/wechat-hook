@@ -76,3 +76,38 @@
    其余用旧偏移的 hook（发送、语音、眼睛、登录监视、xlog）全部 **条件编译关掉**
 3. 在新客户端上验证：`/QueryDB/status` + `/QueryDB/execute` 三库可读
 4. 通过后再逐个恢复：发送 → 语音 → 图片 → 眼睛
+## 阻塞点：注入方式变了（2026-10-24 15:00）
+
+实测新版 4.1.15.56：
+
+```
+Weixin.exe  导入表：只有 KERNEL32.dll
+Weixin.dll  导入表：只有 KERNEL32.dll
+→ 所有其它 DLL 都是运行时 LoadLibrary 加载
+
+我们的 version.dll 放 exe 目录 / 放 4.1.15.56 子目录，均未加载
+进程实际加载的是 C:\WINDOWS\system32\version.dll
+→ version.dll 代理劫持在 4.1.15.56 上失效
+```
+
+ETW（logman / Microsoft-Windows-Kernel-Process）抓 ImageLoad 需要管理员权限，当前会话被拒；
+机器上也没有 Procmon。
+
+### 换注入点的候选
+
+新版 Weixin.dll 里动态加载的自有 DLL（且已在客户端目录）：
+
+| 候选 | 大小 | 备注 |
+|---|---|---|
+| `ilink_wrapper.dll` | 0.23MB | 最小，导出少，优先试 |
+| `ConfSdk.dll` | 1.22MB | |
+| `roam_migration.dll` | 6.09MB | |
+| `VoipEngine.dll` | 19.92MB | 太大 |
+
+做法：把原 DLL 改名（如 `ilink_wrapper_orig.dll`），我们的 DLL 用 `.def` 转发全部导出到 orig，
+并保留 hook 初始化逻辑；再验证是否被加载、是否优先于版本目录。
+
+### 结论
+
+适配 4.1.15.56 = **注入方案重做 + 偏移全套重逆**，工作量按周计，不是小时级。
+机器人继续跑 4.1.10.27（稳定）。
