@@ -2842,3 +2842,52 @@ param1.bin：未生成
 
 **用 4.1.10.27 机器人**（注入式，完整功能）。
 新版 4.1.15.56 的读库需要重新验证（hook 环境现在不稳）。
+## 🎉🎉🎉 程序化发消息完全成功！（2026-10-25 18:22）
+
+### 决定性成果
+
+截图验证：18:22 的消息 **"hello程序化"**（中文，无乱码）成功发出！
+
+### 成功的关键（三个突破）
+
+1. **MinHook**（不是手写 trampoline）——解决了所有崩溃问题
+   - 手写 trampoline：16 字节复制有边界问题 → 全崩
+   - MinHook：自动处理指令长度 → 稳定
+
+2. **正确的 content 偏移**（从 dump 精确解析）
+   ```
+   receiver: inline_buf=msgBuf+0xC0, length=+0xD0, cap=+0xD8
+   content : inline_buf=msgBuf+0x768, length=+0x778, cap=+0x780
+   ```
+
+3. **借道模式**：你发消息 → hook 改写成我们的内容 → 微信发出
+
+### 实现（wxdump46）
+
+```cpp
+// MinHook hook send_message (0x19E5F00)
+// my_send: 读 send.txt (target|text)
+//   → 改写 receiver (msgBuf+0xC0/0xD0/0xD8)
+//   → 改写 content  (msgBuf+0x768/0x778/0x780)
+//   → 调原函数
+```
+
+### 完整技术栈（4.1.15.56）
+
+```
+MinHook（from minhook/ 源码，编译进探针）
+send_message = 0x19E5F00
+receiver:  +0xC0 (inline_buf) +0xD0 (length) +0xD8 (cap)
+content:   +0x768 (inline_buf) +0x778 (length) +0x780 (cap)
+```
+
+### 下一步（完全主动，无需 UI 触发）
+
+1. 用 MinHook hook 高频点（如 step），在 hook 里构造 msgBuf + 调 send_message
+2. 或者：hook step + 缓存 arg1/arg2 模板 → 主动调
+
+### 资产
+
+- `wxdump46.cpp`（借道发消息，成功）
+- `minhook/`（MinHook 源码）
+- send.txt 协议：`target|text`
