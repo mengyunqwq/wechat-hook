@@ -2891,3 +2891,55 @@ content:   +0x768 (inline_buf) +0x778 (length) +0x780 (cap)
 - `wxdump46.cpp`（借道发消息，成功）
 - `minhook/`（MinHook 源码）
 - send.txt 协议：`target|text`
+## 🎉🎉🎉 完全程序化发消息成功！（2026-10-25 18:29）
+
+### 决定性证据
+
+截图：18:25 的消息 **"自动发来的消息"**（中文，无乱码，自动发出，无需用户操作）
+
+### 完整技术链路
+
+```
+1. 程序创建 send.txt（filehelper|自动发来的消息）
+2. PostMessage 点击输入框 + 输入 + 回车（自动触发）
+3. MinHook 拦截 send_message (0x19E5F00)
+4. hook 改写 msgBuf：
+     receiver (msgBuf+0xC0/0xD0/0xD8)
+     content  (msgBuf+0x768/0x778/0x780)
+5. 调原函数 → 微信发出
+```
+
+### 成功要素（全部验证）
+
+| 要素 | 值 |
+|---|---|
+| hook 库 | **MinHook**（手写 trampoline 会崩）|
+| hook 点 | send_message = 0x19E5F00 |
+| receiver | +0xC0 (inline_buf) / +0xD0 (length) / +0xD8 (cap) |
+| content | +0x768 (inline_buf) / +0x778 (length) / +0x780 (cap) |
+| 触发 | PostMessage（自动）|
+| 中文 | ✅ 无乱码 |
+
+### 能力清单
+
+```
+✅ 完全程序化发消息（中文/英文）
+✅ 任意接收者（wxid/群）
+✅ 无需用户操作（PostMessage 自动触发）
+✅ 微信不崩（MinHook 稳定）
+```
+
+### 关键教训（写下来给以后）
+
+1. **手写 trampoline 是崩溃根源** —— 用 MinHook
+2. **content 偏移是 msgBuf+0x768**（从 txt_message_ctr 反汇编 + dump 验证）
+3. **receiver 偏移是 msgBuf+0xC0**
+4. **WeixinString 布局：inline_buf(16) + length(+0x10) + cap(+0x18)**
+5. **改写在 hook 里（send_message 调用时），对象有效**
+6. **触发用 PostMessage**（输入+回车），自动完成
+
+### 文件
+
+- `wxdump46.cpp`（借道版，已验证）
+- `minhook/`（MinHook 源码）
+- 探针部署：`D:\wxhook\wx4156\4.1.15.56\wxdump.dll`
