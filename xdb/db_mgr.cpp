@@ -55,6 +55,7 @@ namespace db_registry {
     // 安装钩子的互斥：早装线程 / DatabaseMgr 构造 / HTTP 线程可能同时进来
     std::recursive_mutex g_installMtx;
 
+std::atomic<uintptr_t> g_lastVfs{ 0 };   // 最近一次 vfs_find 的结果（诊断用）
 std::atomic<long long> g_connLockOk{ 0 };     // 成功拿到连接锁的次数
 std::atomic<long long> g_connLockNull{ 0 };   // db_mutex 为空/未生效的次数（锁没起作用）
 
@@ -279,6 +280,7 @@ private:
         if (api == nullptr || api->vfs_find == nullptr || api->db_filename == nullptr) return 0;
         sqlite3_vfs* vfs = nullptr;
         vfs = vfsFindSafe(api);
+        g_lastVfs.store((uintptr_t)vfs);
         if (vfs == nullptr) return 0;
 
         int added = 0;
@@ -1805,6 +1807,9 @@ private:
         const uintptr_t slot = (g_api != nullptr) ? (uintptr_t)g_api->db_mutex : 0;
         j["db_mutex_slot"] = format_string("0x%llX", (unsigned long long)slot);
         j["db_mutex_in_module"] = (modBase != 0 && modSize != 0 && slot >= modBase && slot < modBase + modSize);
+        j["vfs_find_slot"] = format_string("0x%llX", (unsigned long long)(g_api ? (uintptr_t)g_api->vfs_find : 0));
+        j["vfs_ptr"] = format_string("0x%llX", (unsigned long long)g_lastVfs.load());
+        j["vfs_null"] = (g_lastVfs.load() == 0);
         j["lock_ok"] = g_connLockOk.load(std::memory_order_relaxed);
         j["lock_null"] = g_connLockNull.load(std::memory_order_relaxed);
         j["effective"] = (g_connLockOk.load(std::memory_order_relaxed) > 0);
@@ -1828,7 +1833,7 @@ private:
             return true;
         };
 
-        if (api->open_v2 != nullptr) {
+        if (g_WxVersion == 0 && api->open_v2 != nullptr) {   // 新版：表项也不改（微信校验 → 崩），只用只读扫描
             open_v2_t orig = (open_v2_t)api->open_v2;
             if (patchSlot((void**)&api->open_v2, (void*)&detourOpenV2)) {
                 g_origOpenV2 = orig;
