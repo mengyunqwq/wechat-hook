@@ -1377,10 +1377,12 @@ namespace
         DWORD pid = 0;
         GetWindowThreadProcessId(h, &pid);
         if (pid != f->pid) return TRUE;
-        if (!IsWindowVisible(h)) return TRUE;
         RECT r;
         if (!GetWindowRect(h, &r)) return TRUE;
         if ((r.right - r.left) < 500 || (r.bottom - r.top) < 400) return TRUE;  // 排除小弹窗
+        wchar_t cls[128] = {0};
+        GetClassNameW(h, cls, 128);
+        if (!wcsstr(cls, L"QWindowIcon")) return TRUE;   // 只认主窗口类
         f->hwnd = h;
         return FALSE;
     }
@@ -1443,6 +1445,14 @@ namespace
         return w;
     }
 
+    void SendEsc()
+    {
+        INPUT in[2] = {};
+        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_ESCAPE;
+        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_ESCAPE; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        ::SendInput(2, in, sizeof(INPUT));
+    }
+
     void SendCtrlV()
     {
         INPUT in[4] = {};
@@ -1462,7 +1472,22 @@ namespace
         ::Sleep(waitMs);
     }
 
+    int DoAutoPostOnce(const std::string& text, std::string* diag, int attempt);
+
     int DoAutoPost(const std::string& text, std::string* diag)
+    {
+        int last = -1;
+        for (int i = 0; i < 2; ++i)
+        {
+            last = DoAutoPostOnce(text, diag, i);
+            if (last == 0) return 0;
+            if (diag) { *diag += ""; }
+            ::Sleep(1500);
+        }
+        return last;
+    }
+
+    int DoAutoPostOnce(const std::string& text, std::string* diag, int attempt)
     {
         HWND hwnd = FindMainWindow();
         if (!hwnd) { if (diag) *diag = "{\"why\":\"no main window\"}"; return -1; }
@@ -1472,32 +1497,52 @@ namespace
         int w = r.right - r.left, h = r.bottom - r.top;
         if (w < 500 || h < 400) { if (diag) *diag = "{\"why\":\"window too small\"}"; return -2; }
 
+        ::ShowWindow(hwnd, SW_SHOW);
         ::ShowWindow(hwnd, SW_RESTORE);
         ::SetForegroundWindow(hwnd);
-        ::Sleep(500);
+        ::Sleep(700);
+
+        // 清掉可能残留的发表编辑器：点「取消」。没有对话框时这一下落在动态页空白处，无害。
+        // （不能用 ESC —— 微信主窗口按 ESC 会被收进托盘）
+        ClickRel(hwnd, 390, 446, false, 700);
+
+        // 装 mmsnspost 捕获钩子并用命中数验证「真的发出去了」
+        bool hookOk = InstallMomentHook();
+        InterlockedExchange(&g_capHits, 0);
 
         // 1) 发现 → 朋友圈
         ClickRel(hwnd, 30, 240, false, 1200);
         ClickRel(hwnd, 130, 103, false, 1500);
+        // 1.5) 再点一次「朋友圈」确保在动态页并拿到焦点
+        ClickRel(hwnd, 130, 103, false, 900);
         // 2) 右键相机 → 发表
-        ClickRel(hwnd, 762, 55, true, 1000);
-        ClickRel(hwnd, 780, 103, false, 1600);
+        ClickRel(hwnd, 762, 55, true, 1200);
+        ClickRel(hwnd, 780, 103, false, 1900);
         // 3) 输入框 + 粘贴
         ClickRel(hwnd, 239, 149, false, 400);
         if (!SetClipboardTextW(Utf8ToWide(text))) { if (diag) *diag = "{\"why\":\"clipboard failed\"}"; return -3; }
         ::Sleep(250);
         SendCtrlV();
         ::Sleep(900);
-        // 4) 发表
-        ClickRel(hwnd, 343, 446, false, 3500);
+        // 4) 发表（点按钮后等真实命中）
+        ClickRel(hwnd, 343, 446, false, 1200);
+
+        bool hit = false;
+        for (int i = 0; i < 40 && !hit; ++i)   // 最多等 ~10 秒
+        {
+            if (g_capHits > 0) { hit = true; break; }
+            ::Sleep(250);
+        }
 
         if (diag)
         {
-            char b[256];
-            std::snprintf(b, sizeof(b), "{\"win\":\"%dx%d\",\"textLen\":%d,\"ok\":1}", w, h, (int)text.size());
+            char b[320];
+            std::snprintf(b, sizeof(b),
+                "{\"win\":\"%dx%d\",\"textLen\":%d,\"hook\":%d,\"hits\":%ld,\"verified\":%d}",
+                w, h, (int)text.size(), hookOk ? 1 : 0, (long)g_capHits, hit ? 1 : 0);
             *diag = b;
         }
-        return 0;
+        return hit ? 0 : -9;   // -9 = 点了但没捕获到真实发表
     }
 }
 
