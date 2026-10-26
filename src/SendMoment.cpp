@@ -277,7 +277,8 @@ int WeixinMoment::SendMoment(const std::string& text, int stage, std::string* di
         ::memset(&q5, 0, sizeof(q5));
         q5.type = 0;
         q5.flag = 0x1D4C0;
-        BuildMsStringC(q5.str, "");
+        // 假设：回调链由 P5 的字符串构建，空串会导致后续空指针 —— 把正文放进去试试
+        BuildMsStringC(q5.str, text.c_str());
 
         int r3 = CallCtorGuarded(fn3, p1x, p2, p3x, p4x, &q5);
         if (diag) *diag = DiagJson(base, singleton, p2, stage, r3);
