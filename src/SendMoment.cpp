@@ -2019,3 +2019,457 @@ void Route_MomentInternal(httplib::Server& svr)
         });
 }
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  PUBLISH-ENTRY-PROBE：勾发表流程入口 0x04EABFBA，抓真实参数与栈
+//  若参数只是 service/上下文对象，我们就能在 UI 线程直接调它 —— 程序化建编辑会话
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    typedef void (*PubFn)(void*, void*, void*, void*);
+    PubFn g_peOrig = nullptr;
+    bool  g_peHooked = false;
+    volatile LONG g_peHits = 0;
+    volatile unsigned long long g_peA[4] = {0,0,0,0};
+    volatile unsigned long long g_peV[4] = {0,0,0,0};   // 解引用
+    volatile unsigned long long g_peVt[4] = {0,0,0,0};  // 若是对象，vtable RVA
+    volatile unsigned char g_peARaw[0x40] = {0};        // rcx 对象前 0x40
+    volatile unsigned long long g_peStk20 = 0, g_peStk28 = 0;  // 第5参(栈)
+
+    int PeDetour(void* a, void* b, void* c, void* d)
+    {
+        __try
+        {
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            void* p[4] = { a, b, c, d };
+            for (int i = 0; i < 4; ++i)
+            {
+                g_peA[i] = (unsigned long long)(uintptr_t)p[i];
+                g_peV[i] = 0; g_peVt[i] = 0;
+                if ((uintptr_t)p[i] > 0x10000)
+                {
+                    __try { g_peV[i] = *(unsigned long long*)p[i]; } __except (1) {}
+                    if (base && g_peV[i] > (unsigned long long)base)
+                        g_peVt[i] = g_peV[i] - (unsigned long long)base;
+                }
+            }
+            if ((uintptr_t)a > 0x10000)
+            {
+                for (int i = 0; i < 0x40; ++i)
+                {
+                    unsigned char ch = 0;
+                    __try { ch = *((unsigned char*)a + i); } __except (1) { ch = 0xEE; }
+                    g_peARaw[i] = ch;
+                }
+            }
+            g_peStk20 = g_peStk28 = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        InterlockedIncrement(&g_peHits);
+        return 0;   // 原函数是 void？保险：不调 original 可能破坏流程，还是调
+    }
+
+    int PeDetour2(void* a, void* b, void* c, void* d)
+    {
+        int r = (int)PeDetour(a, b, c, d);
+        g_peOrig(a, b, c, d);
+        return r;
+    }
+
+    bool InstallPeHook()
+    {
+        if (g_peHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        LPVOID t = (LPVOID)(base + 0x04EABFBA);
+        if (MH_CreateHook(t, (LPVOID)&PeDetour2, (LPVOID*)&g_peOrig) != MH_OK) return false;
+        if (MH_EnableHook(t) != MH_OK) { MH_RemoveHook(t); return false; }
+        g_peHooked = true;
+        return true;
+    }
+
+    bool RemovePeHook()
+    {
+        if (!g_peHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (base) { LPVOID t = (LPVOID)(base + 0x04EABFBA); MH_DisableHook(t); MH_RemoveHook(t); }
+        g_peHooked = false; g_peOrig = nullptr;
+        return true;
+    }
+
+    std::string PeJson()
+    {
+        static const char* HEX = "0123456789abcdef";
+        std::string raw;
+        for (int i = 0; i < 0x40; ++i) { raw += HEX[g_peARaw[i] >> 4]; raw += HEX[g_peARaw[i] & 0xF]; }
+        char b[800];
+        std::snprintf(b, sizeof(b),
+            "{\"hooked\":%s,\"hits\":%ld,"
+            "\"a\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],"
+            "\"v\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],"
+            "\"vt\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"]",
+            g_peHooked ? "true" : "false", (long)g_peHits,
+            g_peA[0], g_peA[1], g_peA[2], g_peA[3],
+            g_peV[0], g_peV[1], g_peV[2], g_peV[3],
+            g_peVt[0], g_peVt[1], g_peVt[2], g_peVt[3]);
+        std::string out(b);
+        out += ",\"aRaw\":\"" + raw + "\"}";
+        return out;
+    }
+}
+
+void Route_PublishEntryProbe(httplib::Server& svr)
+{
+    svr.Post("/Debug/PeHook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallPeHook() : RemovePeHook();
+            json r; r["ok"] = ok; r["hooked"] = g_peHooked;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/PeProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_content(PeJson(), "application/json");
+        });
+    svr.Post("/Debug/PeProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            InterlockedExchange(&g_peHits, 0);
+            json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ── /Debug/SetSvc：手动指定 service 对象（免真实发表捕获；用 /Debug/ScanVt 找实例）──
+void Route_SetSvc(httplib::Server& svr)
+{
+    svr.Post("/Debug/SetSvc", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            unsigned long long v = 0;
+            try { v = std::stoull(body.value("svc", "0"), nullptr, 0); } catch (...) {}
+            g_svcObj = v;
+            json r; r["ok"] = (v != 0); r["svc"] = (unsigned long long)g_svcObj;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/SetSvc", [](const httplib::Request&, httplib::Response& res)
+        {
+            json r; r["svc"] = (unsigned long long)g_svcObj;
+            r["hint"] = "POST {\"svc\":\"0x...\"} 手动设置 service；地址可用 /Debug/ScanVt?rva=0x8B5D308 扫描";
+            res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  DRAFT-WRITER-PROBE：同时钩 4 个「写草稿槽」的函数入口，抓谁创建草稿
+//    ① 0x04EA08C0 (写点 +0xCE3)   ② 0x04EA2E90 (+0x13C)
+//    ③ 0x04EA8220 (+0x3E7)        ④ 0x04EA8CE4 (+0x196)
+//  都是函数入口，MinHook 安全（BizHook 同款先例）
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    struct DWP { void* fn; void** orig; };
+    // 统一签名：这四个都是成员函数，至少 (rcx, rdx)
+    typedef int (*DW2)(void*, void*);
+
+    DW2 g_dwOrig[4] = {nullptr,nullptr,nullptr,nullptr};
+    bool g_dwHooked[4] = {false,false,false,false};
+    const unsigned long long RVA_SITES[4] = {0x04EA08C0, 0x04EA2E90, 0x04EA8220, 0x04EA8CE4};
+    // 各函数里写 +0x258 的 RVA（判断"是否已写到"）
+    const unsigned long long RVA_WRITES[4] = {0x04EA15A3, 0x04EA2FCC, 0x04EA8607, 0x04EA8E7A};
+
+    volatile LONG g_dwHits[4] = {0,0,0,0};
+    volatile unsigned long long g_dwRcx[4] = {0,0,0,0};
+    volatile unsigned long long g_dwRdx[4] = {0,0,0,0};
+    volatile LONG g_dwSlotBefore[4] = {0,0,0,0};   // 入口时 [rcx+0x258]
+    volatile LONG g_dwSlotAfter[4]  = {0,0,0,0};   // 返回后 [rcx+0x258]
+
+    static char g_dwDraftSnap[0x100] = {0};        // 最近一次"草稿被创建"时草稿对象快照
+
+    int DWDetour(int idx, void* rcx, void* rdx)
+    {
+        unsigned long long before = 0, after = 0;
+        __try { before = *(unsigned long long*)((uintptr_t)rcx + 0x258); } __except (1) {}
+        InterlockedIncrement(&g_dwHits[idx]);
+        g_dwRcx[idx] = (unsigned long long)(uintptr_t)rcx;
+        g_dwRdx[idx] = (unsigned long long)(uintptr_t)rdx;
+        InterlockedExchange(&g_dwSlotBefore[idx], (long)(before >> 32));   // 低位展示
+        g_dwSlotBefore[idx] = (long)(before & 0xFFFFFFFF);
+
+        int r = g_dwOrig[idx](rcx, rdx);
+
+        __try { after = *(unsigned long long*)((uintptr_t)rcx + 0x258); } __except (1) {}
+        g_dwSlotAfter[idx] = (long)(after & 0xFFFFFFFF);
+        if (after > 0x10000 && before <= 0x10000)
+        {
+            // 草稿被创建了 —— 抓它的内存
+            unsigned long long d = after;
+            for (int i = 0; i < 0x100; ++i)
+            {
+                unsigned char ch = 0;
+                __try { ch = *((unsigned char*)(uintptr_t)d + i); } __except (1) { ch = 0xEE; }
+                g_dwDraftSnap[i] = (char)ch;
+            }
+        }
+        return r;
+    }
+
+    int DW0(void* a, void* b) { return DWDetour(0, a, b); }
+    int DW1(void* a, void* b) { return DWDetour(1, a, b); }
+    int DW2_(void* a, void* b) { return DWDetour(2, a, b); }
+    int DW3(void* a, void* b) { return DWDetour(3, a, b); }
+    void* g_dwDetours[4] = { (void*)&DW0, (void*)&DW1, (void*)&DW2_, (void*)&DW3 };
+
+    // 注意：这些函数参数个数可能 >2，统一 detour 会吃掉 r8/r9 ——封掉风险：只钩 ②/④（进函数越小越可能全用 (rcx,rdx)）
+    bool InstallDwHook()
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        int idxs[2] = {1, 3};
+        for (int k = 0; k < 2; ++k)
+        {
+            int i = idxs[k];
+            LPVOID t = (LPVOID)(base + RVA_SITES[i]);
+            if (MH_CreateHook(t, g_dwDetours[i], (LPVOID*)&g_dwOrig[i]) == MH_OK &&
+                MH_EnableHook(t) == MH_OK)
+                g_dwHooked[i] = true;
+        }
+        return g_dwHooked[1] || g_dwHooked[3];
+    }
+
+    bool RemoveDwHook()
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        for (int i = 0; i < 4; ++i)
+        {
+            if (!g_dwHooked[i]) continue;
+            if (base) { LPVOID t = (LPVOID)(base + RVA_SITES[i]); MH_DisableHook(t); MH_RemoveHook(t); }
+            g_dwHooked[i] = false; g_dwOrig[i] = nullptr;
+        }
+        return true;
+    }
+
+    std::string DwJson()
+    {
+        std::string j = "[";
+        for (int i = 0; i < 4; ++i)
+        {
+            char b[256];
+            std::snprintf(b, sizeof(b),
+                "%s{\"site\":\"0x%llX\",\"hooked\":%d,\"hits\":%ld,\"rcx\":\"0x%llX\",\"rdx\":\"0x%llX\","
+                "\"slotBefore\":\"0x%X\",\"slotAfter\":\"0x%X\"}",
+                i ? "," : "", RVA_SITES[i], g_dwHooked[i], (long)g_dwHits[i],
+                g_dwRcx[i], g_dwRdx[i], (unsigned)g_dwSlotBefore[i], (unsigned)g_dwSlotAfter[i]);
+            j += b;
+        }
+        j += "]";
+        return j;
+    }
+}
+
+void Route_DraftWriterProbe(httplib::Server& svr)
+{
+    svr.Post("/Debug/DwHook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallDwHook() : RemoveDwHook();
+            json r; r["ok"] = ok; r["state"] = DwJson();
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/DwProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            json r;
+            r["sites"] = DwJson();
+            static const char* HEX = "0123456789abcdef";
+            std::string raw;
+            char* p = g_dwDraftSnap;
+            for (int i = 0; i < 0x100; ++i) { unsigned char c = (unsigned char)p[i]; raw += HEX[c >> 4]; raw += HEX[c & 0xF]; }
+            r["draftSnap"] = raw;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Post("/Debug/DwProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            for (int i = 0; i < 4; ++i) { InterlockedExchange(&g_dwHits[i], 0); g_dwRcx[i]=0; g_dwRdx[i]=0; g_dwSlotBefore[i]=0; g_dwSlotAfter[i]=0; }
+            ::memset(g_dwDraftSnap, 0, sizeof(g_dwDraftSnap));
+            json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SILENT-POST：消息级静默发表（不移动鼠标、不抢前台、可在后台运行）
+//
+//  实测流程（本机 4.1.10.27 验证通过）：
+//    ① PostMessage WM_RBUTTONDOWN/UP 到主窗口相机图标(762,55)  → 弹菜单
+//    ② PostMessage 左键到菜单(Qt51514QWindowToolSaveBits)项「发表文字」(105,88) → 开编辑器
+//    ③ 逐字节 PostMessage WM_CHAR（GBK 编码！微信用 ANSI 解码）→ 中文正确
+//    ④ PostMessage 左键到编辑器「发表」按钮(145,378) → 发布
+//  验证：contentDesc 在 XML 里为正确 UTF-8
+// ═════════════════════════════════════════════════════════════════════════════
+namespace silentpost
+{
+    struct RECTS { LONG l, t, r, b; };
+
+    bool EnumWinsByClass(DWORD pid, const wchar_t* cls, int minW, int maxW,
+                         HWND* out, int maxOut, int* count)
+    {
+        struct Ctx { DWORD pid; const wchar_t* cls; int minW, maxW; HWND* out; int maxOut; int* n; };
+        Ctx ctx = { pid, cls, minW, maxW, out, maxOut, count };
+        *count = 0;
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            Ctx* c = (Ctx*)lp;
+            DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+            if (pid != c->pid) return TRUE;
+            wchar_t buf[256] = {0};
+            GetClassNameW(h, buf, 256);
+            if (::wcsicmp(buf, c->cls) != 0) return TRUE;
+            RECTS r; ::GetWindowRect(h, (LPRECT)&r);
+            int w = r.r - r.l;
+            if (w < c->minW || w > c->maxW) return TRUE;
+            if (*c->n < c->maxOut) c->out[(*c->n)++] = h;
+            return TRUE;
+        }, (LPARAM)&ctx);
+        return *count > 0;
+    }
+
+    void PostLClick(HWND h, int rx, int ry)
+    {
+        RECTS r; ::GetWindowRect(h, (LPRECT)&r);
+        POINT p; p.x = r.l + rx; p.y = r.t + ry;
+        ::ScreenToClient(h, &p);
+        LPARAM lp = MAKELPARAM((p.x & 0xFFFF), (p.y & 0xFFFF));
+        ::PostMessageW(h, WM_MOUSEMOVE, 0, lp);
+        ::Sleep(90);
+        ::PostMessageW(h, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+        ::Sleep(80);
+        ::PostMessageW(h, WM_LBUTTONUP, 0, lp);
+    }
+
+    void PostRClick(HWND h, int rx, int ry)
+    {
+        RECTS r; ::GetWindowRect(h, (LPRECT)&r);
+        POINT p; p.x = r.l + rx; p.y = r.t + ry;
+        ::ScreenToClient(h, &p);
+        LPARAM lp = MAKELPARAM((p.x & 0xFFFF), (p.y & 0xFFFF));
+        ::PostMessageW(h, WM_RBUTTONDOWN, MK_RBUTTON, lp);
+        ::Sleep(110);
+        ::PostMessageW(h, WM_RBUTTONUP, 0, lp);
+    }
+
+    bool IsWindowGone(HWND h)
+    {
+        return !::IsWindow(h) || !::IsWindowVisible(h);
+    }
+
+    std::wstring Utf8ToWide(const std::string& utf8)
+    {
+        int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+        if (n <= 0) return std::wstring();
+        std::wstring w((size_t)n, 0);
+        ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &w[0], n);
+        return w;
+    }
+
+    std::string Utf8ToGbk(const std::string& utf8)
+    {
+        int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+        if (n <= 0) return std::string();
+        std::wstring w((size_t)n, L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &w[0], n);
+        int m = ::WideCharToMultiByte(936, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+        if (m <= 0) return std::string();
+        std::string g((size_t)m, '\0');
+        ::WideCharToMultiByte(936, 0, w.c_str(), (int)w.size(), &g[0], m, nullptr, nullptr);
+        return g;
+    }
+
+    // 返回值：0 成功；负数失败
+    int Post(const std::string& utf8Text, std::string* err)
+    {
+        DWORD pid = ::GetCurrentProcessId();
+        HWND ws[16]; int n = 0;
+
+        if (!EnumWinsByClass(pid, L"Qt51514QWindowIcon", 700, 4000, ws, 16, &n) || n == 0)
+        { if (err) *err = "no main window"; return -1; }
+        HWND main = ws[0];
+
+        // ⓪ 导航到朋友圈页（幂等：发现 → 朋友圈）
+        PostLClick(main, 30, 240);
+        ::Sleep(1400);
+        PostLClick(main, 133, 104);
+        ::Sleep(1800);
+
+        // ① 右键相机
+        PostRClick(main, 762, 55);
+        ::Sleep(1500);
+
+        // ② 菜单
+        HWND menus[8]; int mn = 0;
+        if (!EnumWinsByClass(pid, L"Qt51514QWindowToolSaveBits", 100, 600, menus, 8, &mn) || mn == 0)
+        { if (err) *err = "no menu (camera icon not found?)"; return -2; }
+        PostLClick(menus[0], 105, 88);       // 发表文字
+        ::Sleep(2400);
+
+        // ③ 编辑器（宽度 250~700，且不是主窗口）
+        HWND eds[8]; int en = 0;
+        if (!EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, eds, 8, &en) || en == 0)
+        { if (err) *err = "no editor"; return -3; }
+        HWND ed = eds[0];
+        for (int i = 0; i < en; ++i) if (eds[i] != main) { ed = eds[i]; break; }
+
+        // 清空
+        for (int i = 0; i < 40; ++i) { ::PostMessageW(ed, WM_CHAR, 8, 1); ::Sleep(25); }
+        ::Sleep(400);
+
+        // 输入：UTF-16 码点（微信按 Unicode 处理 WM_CHAR）
+        std::wstring w = silentpost::Utf8ToWide(utf8Text);
+        if (w.empty() && !utf8Text.empty()) { if (err) *err = "utf8->utf16 failed"; return -4; }
+        for (wchar_t wc : w)
+        {
+            if (wc == 10) { ::PostMessageW(ed, WM_CHAR, 13, 1); ::Sleep(45); continue; }
+            if (wc == 13) continue;
+            ::PostMessageW(ed, WM_CHAR, (WPARAM)wc, 1);
+            ::Sleep(45);
+        }
+        ::Sleep(700);
+
+        // ④ 点发表
+        PostLClick(ed, 145, 378);
+        ::Sleep(3500);
+
+        if (!IsWindowGone(ed))
+        { if (err) *err = "editor still open (publish may have failed)"; return -5; }
+        return 0;
+    }
+}
+
+void Route_SilentMoment(httplib::Server& svr)
+{
+    svr.Post("/Moment/PostSilent", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            std::string text = body.value("text", "");
+            if (text.empty()) { json r; r["ret"] = -400; r["retmsg"] = "empty text"; res.set_content(r.dump(), "application/json"); return; }
+            std::string err;
+            int ret = silentpost::Post(text, &err);
+            json r;
+            r["ret"] = ret;
+            r["retmsg"] = (ret == 0) ? "ok" : err;
+            r["text"] = text;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Moment/PostSilent", [](const httplib::Request&, httplib::Response& res)
+        {
+            json r;
+            r["usage"] = "POST {\"text\":\"...\"} —— 消息级静默发表（不动鼠标/不抢前台）";
+            r["flow"] = "右键相机 → 发表文字 → WM_CHAR(GBK) → 点发表";
+            res.set_content(r.dump(), "application/json");
+        });
+}
+

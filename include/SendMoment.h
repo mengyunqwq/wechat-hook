@@ -21,6 +21,10 @@ void Route_DispatcherProbe(httplib::Server& svr);
 void Route_TaskSrcProbe(httplib::Server& svr);
 void Route_XmlProbe(httplib::Server& svr);
 void Route_MomentInternal(httplib::Server& svr);
+void Route_PublishEntryProbe(httplib::Server& svr);
+void Route_SetSvc(httplib::Server& svr);
+void Route_DraftWriterProbe(httplib::Server& svr);
+void Route_SilentMoment(httplib::Server& svr);
 
 namespace WeixinMoment
 {
