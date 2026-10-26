@@ -13,6 +13,8 @@ void Route_SendMoment(httplib::Server& svr);
 void Route_SendMomentCapture(httplib::Server& svr);
 void Route_SendMomentBiz(httplib::Server& svr);
 void Route_SendMomentDispatch(httplib::Server& svr);
+void Route_SendMomentUi(httplib::Server& svr);
+void Route_SendMomentBizCall(httplib::Server& svr);
 
 namespace WeixinMoment
 {

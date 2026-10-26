@@ -35,6 +35,20 @@ namespace
 {
     inline uintptr_t WxBase() { return (uintptr_t)GetModuleHandleA("Weixin.dll"); }
 
+    // 纯 C 版：避免在带 __try 的函数里引入 std::string（C2712）
+    inline void BuildMsStringC(void* dst, const char* s)
+    {
+        char* p = (char*)dst;
+        ::memset(p, 0, 32);
+        size_t n = s ? ::strlen(s) : 0;
+        if (n <= 15) { if (n) ::memcpy(p, s, n); *(size_t*)(p + 0x10) = n; *(size_t*)(p + 0x18) = 15; }
+        else {
+            char* heap = new char[n + 1];
+            ::memcpy(heap, s, n); heap[n] = 0;
+            *(char**)p = heap; *(size_t*)(p + 0x10) = n; *(size_t*)(p + 0x18) = n;
+        }
+    }
+
     // MSVC std::string 布局（32 字节）：buf[16] @+0x00、size @+0x10、cap @+0x18
     // 本函数把 s 写入 dst（dst 指向 string 起点）
     inline void BuildMsString(void* dst, const std::string& s)
@@ -263,7 +277,7 @@ int WeixinMoment::SendMoment(const std::string& text, int stage, std::string* di
         ::memset(&q5, 0, sizeof(q5));
         q5.type = 0;
         q5.flag = 0x1D4C0;
-        BuildMsString(q5.str, "");
+        BuildMsStringC(q5.str, "");
 
         int r3 = CallCtorGuarded(fn3, p1x, p2, p3x, p4x, &q5);
         if (diag) *diag = DiagJson(base, singleton, p2, stage, r3);
@@ -967,6 +981,301 @@ void Route_SendMomentDispatch(httplib::Server& svr)
             g_f2 = g_f4 = 0; g_f2_368 = g_f4_368 = 0; g_f2_350 = g_f4_350 = 0;
             for (int i = 0; i < 5; ++i) { g_dA[i] = g_dV[i] = g_dW[i] = 0; }
             json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  UI-THREAD-EXEC：把 mmsnspost 调用搬到微信 UI 线程上执行
+//
+//  假设：真实发表运行在 UI 线程（Qt 事件循环），任务调度器上下文在那里已就绪；
+//        我们之前在工作线程直接调用，上下文为空 → 空指针。
+//  做法：SetWindowsHookEx(WH_CALLWNDPROC) 挂到 UI 线程 → SendMessage(WM_NULL)
+//        → 钩子过程在 UI 线程被调用 → 在钩子里执行真正的调用。
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    volatile LONG   g_uiPending = 0;
+    volatile unsigned long long g_p2VtRva = 0;
+    volatile int    g_vtIdxUsed = -1;
+    volatile LONG   g_uiDone = 0;
+    int             g_uiRet = 0x7FFFFFFF;
+    char            g_uiXml[2048] = {0};
+    HHOOK           g_uiHook = nullptr;
+    DWORD           g_uiTid = 0;
+
+    // 在调用线程执行：构造 P1(含 XML)/P3/P5 并调用 mmsnspost
+    int DoMomentOnThisThread()
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return -2;
+
+        struct Q5 { unsigned int type; unsigned int flag; char str[32]; void* extra; };
+        typedef void (*P3CtorT)(void*);
+        typedef int (*Fn5)(void*, void*, void*, void*, void*);
+
+        void* singleton = *(void**)(base + offset::sns_singleton_ptr);
+        if (!singleton) return -3;
+
+        // P2 = [[singleton]+0x10]()
+        void* p2 = nullptr;
+        g_p2VtRva = 0;
+        g_vtIdxUsed = -1;
+        __try {
+            using Vfn = void* (*)(void*);
+            void** vt = *(void***)singleton;
+            if (vt && vt[2]) p2 = ((Vfn)vt[2])(singleton);
+            if (p2) {
+                uintptr_t v = *(uintptr_t*)p2;
+                if (v > base) g_p2VtRva = (unsigned long long)(v - base);
+                g_vtIdxUsed = 2;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -4; }
+
+        static char p1[0x200];
+        static char p3[0x200];
+        static char p4[0x100];
+        ::memset(p1, 0, sizeof(p1));
+        ::memset(p3, 0, sizeof(p3));
+        ::memset(p4, 0, sizeof(p4));
+        *(void**)(p1 + 0x38) = (void*)(base + 0x2BD9B9);
+        BuildMsStringC(p1 + 0x40, g_uiXml);
+
+        P3CtorT p3c = (P3CtorT)(base + offset::moment_p3_ctor);
+        __try { p3c(p3); } __except (EXCEPTION_EXECUTE_HANDLER) { return -5; }
+
+        Q5 q5;
+        ::memset(&q5, 0, sizeof(q5));
+        q5.type = 0;
+        q5.flag = 0x1D4C0;
+        BuildMsStringC(q5.str, "");
+
+        Fn5 fn = (Fn5)(base + offset::mmsnspost_ctor);
+        __try { return fn(p1, p2, p3, p4, &q5); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -99; }
+    }
+
+    LRESULT CALLBACK UiCallWndProc(int nCode, WPARAM wParam, LPARAM lParam)
+    {
+        if (nCode >= 0 && InterlockedCompareExchange(&g_uiPending, 0, 1) == 1)
+        {
+            g_uiRet = DoMomentOnThisThread();
+            InterlockedExchange(&g_uiDone, 1);
+        }
+        return CallNextHookEx(g_uiHook, nCode, wParam, lParam);
+    }
+
+    DWORD FindUiThread()
+    {
+        struct Ctx { DWORD pid; DWORD tid; };
+        static Ctx c;
+        c.pid = GetCurrentProcessId();
+        c.tid = 0;
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid != ((Ctx*)lp)->pid) return TRUE;
+            if (!IsWindowVisible(h)) return TRUE;
+            wchar_t cls[128] = {0};
+            GetClassNameW(h, cls, 128);
+            if (wcsstr(cls, L"QWindowIcon") || wcsstr(cls, L"Qt5"))
+            {
+                ((Ctx*)lp)->tid = GetWindowThreadProcessId(h, nullptr);
+                return FALSE;
+            }
+            return TRUE;
+        }, (LPARAM)&c);
+        return c.tid;
+    }
+
+    int RunOnUiThread(const std::string& xml, std::string* diag)
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) { if (diag) *diag = "{\"why\":\"no weixin\"}"; return -2; }
+        if (xml.size() >= sizeof(g_uiXml)) { if (diag) *diag = "{\"why\":\"xml too long\"}"; return -1; }
+        ::memcpy(g_uiXml, xml.c_str(), xml.size() + 1);
+
+        DWORD tid = FindUiThread();
+        if (!tid) { if (diag) *diag = "{\"why\":\"ui thread not found\"}"; return -6; }
+        g_uiTid = tid;
+
+        HWND hwnd = nullptr;
+        {
+            struct C2 { DWORD pid; HWND h; };
+            static C2 c2;
+            c2.pid = GetCurrentProcessId(); c2.h = nullptr;
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                if (pid != ((C2*)lp)->pid) return TRUE;
+                if (!IsWindowVisible(h)) return TRUE;
+                ((C2*)lp)->h = h;
+                return FALSE;
+            }, (LPARAM)&c2);
+            hwnd = c2.h;
+        }
+        if (!hwnd) { if (diag) *diag = "{\"why\":\"no window\"}"; return -7; }
+
+        InterlockedExchange(&g_uiDone, 0);
+        InterlockedExchange(&g_uiPending, 1);
+        g_uiHook = SetWindowsHookExW(WH_CALLWNDPROC, UiCallWndProc,
+                                     (HINSTANCE)GetModuleHandleW(nullptr), tid);
+        if (!g_uiHook)
+        {
+            InterlockedExchange(&g_uiPending, 0);
+            if (diag) { char b[96]; std::snprintf(b, sizeof(b), "{\"why\":\"SetWindowsHookEx failed %lu\"}", GetLastError()); *diag = b; }
+            return -8;
+        }
+
+        // 投递一个无害消息，迫使 UI 线程进入我们的钩子
+        for (int i = 0; i < 20 && !g_uiDone; ++i)
+        {
+            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2000, nullptr);
+            if (g_uiDone) break;
+            ::Sleep(30);
+        }
+
+        if (g_uiHook) { UnhookWindowsHookEx(g_uiHook); g_uiHook = nullptr; }
+        InterlockedExchange(&g_uiPending, 0);
+
+        if (diag)
+        {
+            char b[256];
+            std::snprintf(b, sizeof(b),
+                "{\"uiTid\":%lu,\"done\":%ld,\"ret\":%d,\"xmlLen\":%d,\"p2VtRva\":\"0x%llX\",\"vtIdx\":%d}",
+                (unsigned long)tid, (long)g_uiDone, g_uiRet, (int)xml.size(), g_p2VtRva, g_vtIdxUsed);
+            *diag = b;
+        }
+        return g_uiRet;
+    }
+}
+
+void Route_SendMomentUi(httplib::Server& svr)
+{
+    // POST /SendMoment/Ui { "text": "...", "wxid": "..." } —— 在 UI 线程上直接调用
+    svr.Post("/SendMoment/Ui", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json resp;
+            json body;
+            try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            std::string text = body.value("text", "");
+            std::string wxid = body.value("wxid", "wxid_3odtthhn7u5t22");
+
+            std::string xml = BuildMomentXml(text, wxid, false);
+            std::string diag = "{}";
+            int ret = RunOnUiThread(xml, &diag);
+
+            resp["ret"] = ret;
+            resp["retmsg"] = (ret == 0) ? "ok" : "failed";
+            try { resp["diag"] = json::parse(diag); } catch (...) { resp["diag"] = diag; }
+            res.set_content(resp.dump(), "application/json");
+        });
+
+    // GET /SendMoment/Ui —— 探测 UI 线程
+    svr.Get("/SendMoment/Ui", [](const httplib::Request&, httplib::Response& res)
+        {
+            json j;
+            j["uiTid"] = (unsigned long)FindUiThread();
+            j["note"] = "POST {text,wxid} 在 UI 线程执行 mmsnspost";
+            res.set_content(j.dump(), "application/json");
+        });
+}
+
+
+// ── BIZ-CALL：在 UI 线程上调用业务层 0x04EAE7F0(rcx=对象, rdx=&结构) ─────────
+namespace
+{
+    volatile unsigned long long g_bizRcxTried = 0;
+    volatile int g_bizCallRet = 0x7FFFFFFF;
+
+    int DoBizOnThisThread()
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return -2;
+        typedef int (*BizFn2)(void*, void*);
+        BizFn2 fn = (BizFn2)(base + 0x04EAE7F0);
+
+        void* singleton = *(void**)(base + offset::sns_singleton_ptr);
+        if (!singleton) return -3;
+
+        void* p2 = nullptr;
+        __try {
+            using Vfn = void* (*)(void*);
+            void** vt = *(void***)singleton;
+            if (vt && vt[2]) p2 = ((Vfn)vt[2])(singleton);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -4; }
+
+        static char rdxbuf[0x300];
+        ::memset(rdxbuf, 0, sizeof(rdxbuf));
+
+        g_bizRcxTried = (unsigned long long)(uintptr_t)p2;
+        __try { return fn(p2, rdxbuf); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -99; }
+    }
+
+    LRESULT CALLBACK BizCallWndProc(int nCode, WPARAM wParam, LPARAM lParam)
+    {
+        if (nCode >= 0 && InterlockedCompareExchange(&g_uiPending, 0, 1) == 1)
+        {
+            g_bizCallRet = DoBizOnThisThread();
+            InterlockedExchange(&g_uiDone, 1);
+        }
+        return CallNextHookEx(g_uiHook, nCode, wParam, lParam);
+    }
+
+    int RunBizOnUiThread(std::string* diag)
+    {
+        DWORD tid = FindUiThread();
+        if (!tid) { if (diag) *diag = "{\"why\":\"no ui tid\"}"; return -6; }
+        HWND hwnd = nullptr;
+        {
+            struct C3 { DWORD pid; HWND h; };
+            static C3 c3;
+            c3.pid = GetCurrentProcessId(); c3.h = nullptr;
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+                if (pid != ((C3*)lp)->pid) return TRUE;
+                if (!IsWindowVisible(h)) return TRUE;
+                ((C3*)lp)->h = h; return FALSE;
+            }, (LPARAM)&c3);
+            hwnd = c3.h;
+        }
+        if (!hwnd) { if (diag) *diag = "{\"why\":\"no window\"}"; return -7; }
+
+        InterlockedExchange(&g_uiDone, 0);
+        InterlockedExchange(&g_uiPending, 1);
+        g_uiHook = SetWindowsHookExW(WH_CALLWNDPROC, BizCallWndProc,
+                                     (HINSTANCE)GetModuleHandleW(nullptr), tid);
+        if (!g_uiHook) { InterlockedExchange(&g_uiPending, 0); return -8; }
+        for (int i = 0; i < 20 && !g_uiDone; ++i)
+        {
+            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2000, nullptr);
+            if (g_uiDone) break;
+            ::Sleep(30);
+        }
+        if (g_uiHook) { UnhookWindowsHookEx(g_uiHook); g_uiHook = nullptr; }
+        InterlockedExchange(&g_uiPending, 0);
+        if (diag) {
+            char b[256];
+            std::snprintf(b, sizeof(b), "{\"done\":%ld,\"ret\":%d,\"rcxTried\":\"0x%llX\"}",
+                          (long)g_uiDone, g_bizCallRet, g_bizRcxTried);
+            *diag = b;
+        }
+        return g_bizCallRet;
+    }
+}
+
+void Route_SendMomentBizCall(httplib::Server& svr)
+{
+    svr.Post("/SendMoment/BizCall", [](const httplib::Request&, httplib::Response& res)
+        {
+            std::string diag = "{}";
+            int ret = RunBizOnUiThread(&diag);
+            json r;
+            r["ret"] = ret;
+            r["retmsg"] = (ret == 0) ? "ok" : "failed";
+            try { r["diag"] = json::parse(diag); } catch (...) { r["diag"] = diag; }
+            res.set_content(r.dump(), "application/json");
         });
 }
 
