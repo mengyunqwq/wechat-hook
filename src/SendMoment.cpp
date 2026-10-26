@@ -2434,6 +2434,7 @@ namespace silentpost
         return true;
     }
 
+    // 编辑器特征：宽 250~700，高 >= 380（提示框只有 ~199 高，不能用）
     HWND WaitEditor(HWND main, int tries)
     {
         DWORD pid = ::GetCurrentProcessId();
@@ -2443,9 +2444,30 @@ namespace silentpost
             if (EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, ws, 16, &n))
             {
                 for (int k = 0; k < n; ++k)
-                    if (ws[k] != main && ::IsWindowVisible(ws[k])) return ws[k];
+                {
+                    if (ws[k] == main || !::IsWindowVisible(ws[k])) continue;
+                    RECTS r; ::GetWindowRect(ws[k], (LPRECT)&r);
+                    if ((r.b - r.t) >= 380) return ws[k];
+                }
             }
             ::Sleep(500);
+        }
+        return nullptr;
+    }
+
+    // 检测"格式不支持"这类小提示框（宽 250~700、高 < 380）
+    HWND FindSmallPopup(HWND main)
+    {
+        DWORD pid = ::GetCurrentProcessId();
+        HWND ws[16]; int n = 0;
+        if (EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, ws, 16, &n))
+        {
+            for (int k = 0; k < n; ++k)
+            {
+                if (ws[k] == main || !::IsWindowVisible(ws[k])) continue;
+                RECTS r; ::GetWindowRect(ws[k], (LPRECT)&r);
+                if ((r.b - r.t) < 380) return ws[k];
+            }
         }
         return nullptr;
     }
@@ -2556,14 +2578,30 @@ namespace silentpost
 
             // ③ 文件对话框 -> 填路径 -> 打开
             HWND dlg = WaitDialog(15);
-            if (!dlg) { if (err) *err = "no file dialog"; return -6; }
+            if (!dlg)
+            {
+                HWND pop = FindSmallPopup(main);
+                if (pop) { ::PostMessageW(pop, WM_CLOSE, 0, 0); ::Sleep(300); }
+                if (err) *err = "no file dialog"; return -6;
+            }
             if (!FillFileDialog(dlg, images)) { if (err) *err = "fill file dialog failed"; return -7; }
             ::Sleep(3200);
 
             // ④ 编辑器
             ed = WaitEditor(main, 20);
             if (!ed) { if (err) *err = "no editor (image rejected?)"; return -8; }
-            ::Sleep(1500);
+            ::Sleep(1800);
+
+            // ★ 校验图片是否真的挂上了：有图时编辑器明显更高（约 528 vs 450）
+            {
+                RECTS cr; ::GetWindowRect(ed, (LPRECT)&cr);
+                int hh = (int)(cr.b - cr.t);
+                if (hh < 500)
+                {
+                    if (err) *err = "image not attached (editor height " + std::to_string(hh) + ", expected >=500)";
+                    return -9;   // 不留半成品：让调用方知道没带图
+                }
+            }
         }
 
         // 清空
