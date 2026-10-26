@@ -1279,3 +1279,252 @@ void Route_SendMomentBizCall(httplib::Server& svr)
         });
 }
 
+
+// ── MEM-SCAN：在进程内存里按 8 字节值搜索（找某类的实例/全局指针）──────────
+namespace
+{
+    // 无对象的读取辅助（避免 C2712）
+    bool SafeReadBlock(const unsigned char* p, size_t n, unsigned char* dst)
+    {
+        __try { ::memcpy(dst, p, n); return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    std::string ScanValue(unsigned long long target, int maxHits, int readOff)
+    {
+        std::string out = "[";
+        int hits = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        unsigned char* addr = nullptr;
+        while (VirtualQuery(addr, &mbi, sizeof(mbi)) && hits < maxHits)
+        {
+            unsigned char* rbase = (unsigned char*)mbi.BaseAddress;
+            size_t size = mbi.RegionSize;
+            bool readable = (mbi.State == MEM_COMMIT) &&
+                            ((mbi.Protect & PAGE_READONLY) || (mbi.Protect & PAGE_READWRITE) ||
+                             (mbi.Protect & PAGE_EXECUTE_READ) || (mbi.Protect & PAGE_EXECUTE_READWRITE) ||
+                             (mbi.Protect & PAGE_WRITECOPY) || (mbi.Protect & PAGE_EXECUTE_WRITECOPY));
+            if (readable && size >= 8)
+            {
+                size_t chunk = size > 0x10000 ? 0x10000 : size;
+                for (size_t off0 = 0; off0 < size && hits < maxHits; off0 += chunk)
+                {
+                    size_t len = (size - off0 > chunk) ? chunk : (size - off0);
+                    static unsigned char buf[0x10000];
+                    if (!SafeReadBlock(rbase + off0, len, buf)) continue;
+                    for (size_t i = 0; i + 8 <= len && hits < maxHits; i += 8)
+                    {
+                        unsigned long long v = *(unsigned long long*)(buf + i);
+                        if (v != target) continue;
+                        unsigned long long extra = 0;
+                        if (readOff >= 0 && readOff >= 0)
+                        {
+                            unsigned char tmp[8];
+                            if (SafeReadBlock(rbase + off0 + i + readOff, 8, tmp))
+                                extra = *(unsigned long long*)tmp;
+                            else
+                                extra = 0xDEAD;
+                        }
+                        char b[128];
+                        std::snprintf(b, sizeof(b), "%s\"0x%llX:0x%llX\"", hits ? "," : "",
+                                      (unsigned long long)(uintptr_t)(rbase + off0 + i), extra);
+                        out += b;
+                        ++hits;
+                    }
+                }
+            }
+            unsigned char* next = rbase + size;
+            if (next <= addr) break;
+            addr = next;
+        }
+        out += "]";
+        return out;
+    }
+}
+
+void Route_MemScan(httplib::Server& svr)
+{
+    // GET /Debug/ScanVt?rva=0x8397020&off=0xf0&max=8
+    svr.Get("/Debug/ScanVt", [](const httplib::Request& req, httplib::Response& res)
+        {
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            unsigned long long rva = 0;
+            int off = 0xF0, maxHits = 8;
+            try {
+                if (req.has_param("rva")) rva = std::stoull(req.get_param_value("rva"), nullptr, 0);
+                if (req.has_param("off")) off = (int)std::stoul(req.get_param_value("off"), nullptr, 0);
+                if (req.has_param("max")) maxHits = (int)std::stoul(req.get_param_value("max"), nullptr, 0);
+            } catch (...) { }
+            json j;
+            j["target"] = (unsigned long long)(base + rva);
+            j["hits"] = ScanValue((unsigned long long)(base + rva), maxHits, off);
+            res.set_content(j.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  AUTO-POST：进程内全自动发朋友圈（自己点 UI，机器人只需一次 HTTP 调用）
+//  内部 API 路线受限于微信的会话上下文（见文档第七节），故用「借道」：
+//  让微信自己走完发表流程，我们只负责点击与输入。全程程序化，无需人工。
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    struct WinFind { DWORD pid; HWND hwnd; };
+    BOOL CALLBACK FindMainWndProc(HWND h, LPARAM lp)
+    {
+        WinFind* f = (WinFind*)lp;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid != f->pid) return TRUE;
+        if (!IsWindowVisible(h)) return TRUE;
+        RECT r;
+        if (!GetWindowRect(h, &r)) return TRUE;
+        if ((r.right - r.left) < 500 || (r.bottom - r.top) < 400) return TRUE;  // 排除小弹窗
+        f->hwnd = h;
+        return FALSE;
+    }
+
+    HWND FindMainWindow()
+    {
+        WinFind f;
+        f.pid = GetCurrentProcessId();
+        f.hwnd = nullptr;
+        EnumWindows(FindMainWndProc, (LPARAM)&f);
+        return f.hwnd;
+    }
+
+    void MouseClickAt(int x, int y, bool rightClick)
+    {
+        ::SetCursorPos(x, y);
+        ::Sleep(60);
+        if (rightClick)
+        {
+            ::mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+            ::Sleep(30);
+            ::mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+        }
+        else
+        {
+            ::mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            ::Sleep(30);
+            ::mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        }
+    }
+
+    bool SetClipboardTextW(const std::wstring& text)
+    {
+        if (!::OpenClipboard(nullptr)) return false;
+        ::EmptyClipboard();
+        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+        bool ok = false;
+        if (h)
+        {
+            void* p = ::GlobalLock(h);
+            if (p)
+            {
+                ::memcpy(p, text.c_str(), bytes);
+                ::GlobalUnlock(h);
+                ok = (::SetClipboardData(CF_UNICODETEXT, h) != nullptr);
+            }
+            if (!ok) ::GlobalFree(h);
+        }
+        ::CloseClipboard();
+        return ok;
+    }
+
+    std::wstring Utf8ToWide(const std::string& s)
+    {
+        if (s.empty()) return std::wstring();
+        int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+        std::wstring w(n, L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+        return w;
+    }
+
+    void SendCtrlV()
+    {
+        INPUT in[4] = {};
+        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_CONTROL;
+        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 'V';
+        in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = 'V';    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+        in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_CONTROL; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        ::SendInput(4, in, sizeof(INPUT));
+    }
+
+    // 在窗口内相对坐标点击
+    void ClickRel(HWND hwnd, int rx, int ry, bool rightClick, int waitMs)
+    {
+        RECT r;
+        ::GetWindowRect(hwnd, &r);
+        MouseClickAt(r.left + rx, r.top + ry, rightClick);
+        ::Sleep(waitMs);
+    }
+
+    int DoAutoPost(const std::string& text, std::string* diag)
+    {
+        HWND hwnd = FindMainWindow();
+        if (!hwnd) { if (diag) *diag = "{\"why\":\"no main window\"}"; return -1; }
+
+        RECT r;
+        ::GetWindowRect(hwnd, &r);
+        int w = r.right - r.left, h = r.bottom - r.top;
+        if (w < 500 || h < 400) { if (diag) *diag = "{\"why\":\"window too small\"}"; return -2; }
+
+        ::ShowWindow(hwnd, SW_RESTORE);
+        ::SetForegroundWindow(hwnd);
+        ::Sleep(500);
+
+        // 1) 发现 → 朋友圈
+        ClickRel(hwnd, 30, 240, false, 1200);
+        ClickRel(hwnd, 130, 103, false, 1500);
+        // 2) 右键相机 → 发表
+        ClickRel(hwnd, 762, 55, true, 1000);
+        ClickRel(hwnd, 780, 103, false, 1600);
+        // 3) 输入框 + 粘贴
+        ClickRel(hwnd, 239, 149, false, 400);
+        if (!SetClipboardTextW(Utf8ToWide(text))) { if (diag) *diag = "{\"why\":\"clipboard failed\"}"; return -3; }
+        ::Sleep(250);
+        SendCtrlV();
+        ::Sleep(900);
+        // 4) 发表
+        ClickRel(hwnd, 343, 446, false, 3500);
+
+        if (diag)
+        {
+            char b[256];
+            std::snprintf(b, sizeof(b), "{\"win\":\"%dx%d\",\"textLen\":%d,\"ok\":1}", w, h, (int)text.size());
+            *diag = b;
+        }
+        return 0;
+    }
+}
+
+void Route_AutoPost(httplib::Server& svr)
+{
+    svr.Post("/Moment/Post", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json resp;
+            json body;
+            try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            std::string text = body.value("text", "");
+            if (text.empty()) { resp["ret"] = -1; resp["retmsg"] = "text required"; res.set_content(resp.dump(), "application/json"); return; }
+
+            std::string diag = "{}";
+            int ret = DoAutoPost(text, &diag);
+            resp["ret"] = ret;
+            resp["retmsg"] = (ret == 0) ? "posted" : "failed";
+            try { resp["diag"] = json::parse(diag); } catch (...) { resp["diag"] = diag; }
+            res.set_content(resp.dump(), "application/json");
+        });
+
+    svr.Get("/Moment/Post", [](const httplib::Request&, httplib::Response& res)
+        {
+            json j;
+            j["note"] = "POST {text} 全自动发朋友圈（进程内自动操作 UI）";
+            j["hwnd"] = (unsigned long long)(uintptr_t)FindMainWindow();
+            res.set_content(j.dump(), "application/json");
+        });
+}
+
