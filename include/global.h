@@ -130,6 +130,22 @@ namespace offset
     inline uint64_t voice_send_inner_vtbl = 0x8DD0028;// 数据目标（内层 vtable，类型判别）
     inline uint64_t voice_send_inner_dtor = 0x619B7C0;// 数据目标（内层 vtable[0]，预检用）
     inline uint64_t voice_send_outer_slot0 = 0xA7F0;  // 数据目标（外层 vtable[0]，预检用）
+
+    // ── MOMENT-SEND：/SendMoment（发朋友圈）────────────────────────────────
+    //  逆向结论（4.1.10.27，RVA 相对 Weixin.dll 的 0x180000000 基址）：
+    //    0x04EB0B90  构造 mmsnspost 请求并 CoCgiSendRequest 发送（唯一调用点在 0x04EAF2EA）
+    //    5 个参数：rcx=输出对象 P1（0x38 字节起，栈上）、rdx=P2（单例虚方法返回）、
+    //              r8=P3（栈结构）、r9=P4（std::string）、栈上第 5 参=P5
+    //    P5 = { DWORD type; DWORD flag; std::string text; void* extra; }
+    //        type=0（普通朋友圈），flag=0x1D4C0（调用方常量 0x1D4C000000000）
+    //    P2 来源：0x180410C0 = { mov rax,[rip+0xA7F9A59]; ret } 读全局单例，
+    //             再 call [[singleton]+0x10] 取虚方法返回值
+    inline uint64_t mmsnspost_ctor    = 0x04EB0B90;  // mmsnspost 请求构造 + 发送
+    // 0x180410C0: mov rax,[rip+0xA7F9A59]; ret
+    //   下一条指令 RVA = 0x410C7，目标 = 0x410C7 + 0xA7F9A59 = 0x0A83AB20
+    inline uint64_t sns_singleton_ptr = 0x0A83AB20;  // SNS 管理器全局单例指针
+    // P3 是 0x1A0 字节对象，必须先调这个构造函数（它把 vtable 写进 +0x00）
+    inline uint64_t moment_p3_ctor    = 0x04DA2BB0;  // P3 构造函数
 }
 
 

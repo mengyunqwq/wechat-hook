@@ -231,6 +231,7 @@
     <ClCompile Include="src\SendImageMsg.cpp" />
     <ClCompile Include="src\SendTextMsg.cpp" />
     <ClCompile Include="src\SendVoiceMsg.cpp" />
+    <ClCompile Include="src\SendMoment.cpp" />
     <ClCompile Include="src\tools.cpp" />
     <ClCompile Include="src\wx_ini_reader.cpp" />
     <ClCompile Include="src\wx_send.cpp" />

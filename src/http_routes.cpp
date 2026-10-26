@@ -5,6 +5,7 @@
 #include "ForwardXMLMsg.h"
 #include "SendImageMsg.h"
 #include "SendVoiceMsg.h"
+#include "SendMoment.h"
 #include "QueryDB.h"
 
 void RegisterRoutes(httplib::Server& svr)
@@ -14,5 +15,6 @@ void RegisterRoutes(httplib::Server& svr)
     Route_ForwardXMLMsg(svr);
     Route_SendImageMsg(svr);
     Route_SendVoiceMsg(svr);
+    Route_SendMoment(svr);
     Route_QueryDB(svr);
 }
