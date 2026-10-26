@@ -2316,6 +2316,12 @@ namespace silentpost
 {
     struct RECTS { LONG l, t, r, b; };
 
+    // 最近一次发表的定位信息（诊断用：证实"自适应定位"真的生效）
+    volatile LONG g_btnGreenHit = 0;
+    volatile LONG g_btnX = 0, g_btnY = 0;
+    volatile LONG g_camX = 0;
+    volatile LONG g_menuItemY = 0;
+
     bool EnumWinsByClass(DWORD pid, const wchar_t* cls, int minW, int maxW,
                          HWND* out, int maxOut, int* count)
     {
@@ -2472,6 +2478,68 @@ namespace silentpost
         return nullptr;
     }
 
+    // 抓窗口像素（PrintWindow → 32bpp DIB，top-down）
+    bool GrabPixels(HWND h, std::vector<unsigned>& out, int& W, int& H)
+    {
+        RECTS r; if (!::GetWindowRect(h, (LPRECT)&r)) return false;
+        W = (int)(r.r - r.l); H = (int)(r.b - r.t);
+        if (W <= 0 || H <= 0 || W > 3000 || H > 3000) return false;
+
+        HDC hdc = ::GetWindowDC(h);
+        HDC mdc = ::CreateCompatibleDC(hdc);
+        HBITMAP bmp = ::CreateCompatibleBitmap(hdc, W, H);
+        HGDIOBJ old = ::SelectObject(mdc, bmp);
+        BOOL ok = ::PrintWindow(h, mdc, 2);
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = W;
+        bi.bmiHeader.biHeight = -H;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        out.resize((size_t)W * (size_t)H);
+        int lines = ::GetDIBits(mdc, bmp, 0, H, out.data(), &bi, DIB_RGB_COLORS);
+        ::SelectObject(mdc, old);
+        ::DeleteObject(bmp);
+        ::DeleteDC(mdc);
+        ::ReleaseDC(h, hdc);
+        return ok && lines > 0;
+    }
+
+    // 找微信绿按钮（#07C160 附近）→ 返回窗口内中心坐标
+    // 用来定位「发表」：不再依赖「高度-72」这类写死值
+    bool FindGreenButton(HWND h, int& cx, int& cy)
+    {
+        std::vector<unsigned> px; int W = 0, H = 0;
+        if (!GrabPixels(h, px, W, H)) return false;
+        int minX = W, minY = H, maxX = -1, maxY = -1, cnt = 0;
+        for (int y = 0; y < H; ++y)
+        {
+            for (int x = 0; x < W; ++x)
+            {
+                unsigned p32 = px[(size_t)y * (size_t)W + (size_t)x];
+                int b = (int)(p32 & 0xFF);
+                int g = (int)((p32 >> 8) & 0xFF);
+                int r = (int)((p32 >> 16) & 0xFF);
+                if ((r - 7) * (r - 7) < 1600 && (g - 193) * (g - 193) < 1600 && (b - 96) * (b - 96) < 2025)
+                {
+                    ++cnt;
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (cnt < 300 || maxX < 0) return false;
+        // 只接受"按钮形状"：宽高都要有量，且不会占满整窗
+        int bw = maxX - minX, bh = maxY - minY;
+        if (bw < 40 || bh < 16 || bw > W || bh > H / 2) return false;
+        cx = (minX + maxX) / 2;
+        cy = (minY + maxY) / 2;
+        return true;
+    }
+
     HWND WaitDialog(int tries)
     {
         for (int i = 0; i < tries; ++i)
@@ -2539,7 +2607,10 @@ namespace silentpost
             HWND menus[8]; int mn = 0;
             for (int attempt = 0; attempt < 3; ++attempt)
             {
-                PostRClick(main, 762, 55);
+                RECTS mr; ::GetWindowRect(main, (LPRECT)&mr);
+                int camX = (int)(mr.r - mr.l) - 44;      // 相机是最右侧倒数第二个图标
+                g_camX = camX;
+                PostRClick(main, camX, 55);
                 ::Sleep(1700);
                 if (EnumWinsByClass(pid, L"Qt51514QWindowToolSaveBits", 100, 600, menus, 8, &mn) && mn > 0) break;
                 PostLClick(main, 133, 104);      // 重新点一下朋友圈，恢复页面状态
@@ -2547,7 +2618,12 @@ namespace silentpost
             }
             if (mn == 0)
             { if (err) *err = "no menu (camera icon not found?)"; return -2; }
-            PostLClick(menus[0], 105, 88);
+            {
+                RECTS mr2; ::GetWindowRect(menus[0], (LPRECT)&mr2);
+                int mw = (int)(mr2.r - mr2.l), mh = (int)(mr2.b - mr2.t);
+                g_menuItemY = (int)(mh * 0.72);
+                PostLClick(menus[0], mw / 2, (int)g_menuItemY);   // 第 2 项：发表文字
+            }
             ::Sleep(2400);
 
             // ③ 编辑器
@@ -2563,7 +2639,10 @@ namespace silentpost
             HWND menus[8]; int mn = 0;
             for (int attempt = 0; attempt < 3; ++attempt)
             {
-                PostRClick(main, 762, 55);
+                RECTS mr; ::GetWindowRect(main, (LPRECT)&mr);
+                int camX = (int)(mr.r - mr.l) - 44;
+                g_camX = camX;
+                PostRClick(main, camX, 55);
                 ::Sleep(1700);
                 if (EnumWinsByClass(pid, L"Qt51514QWindowToolSaveBits", 100, 600, menus, 8, &mn) && mn > 0) break;
                 PostLClick(main, 133, 104);
@@ -2573,7 +2652,12 @@ namespace silentpost
             { if (err) *err = "no menu (camera icon not found?)"; return -2; }
 
             // ② 菜单 -> 选照片或视频（第一项）
-            PostLClick(menus[0], 105, 45);
+            {
+                RECTS mr2; ::GetWindowRect(menus[0], (LPRECT)&mr2);
+                int mw = (int)(mr2.r - mr2.l), mh = (int)(mr2.b - mr2.t);
+                g_menuItemY = (int)(mh * 0.36);
+                PostLClick(menus[0], mw / 2, (int)g_menuItemY);   // 第 1 项：选照片或视频
+            }
             ::Sleep(2500);
 
             // ③ 文件对话框 -> 填路径 -> 打开
@@ -2620,11 +2704,16 @@ namespace silentpost
         }
         ::Sleep(700);
 
-        // ⑤ 点发表（按钮距底部固定 72px；有图时编辑器更高）
+        // ⑤ 点发表：优先按「微信绿按钮」像素定位（自适应布局/皮肤），失败才退回高度推算
+        int px = 0, py = 0;
+        int bx = 144, by;
         RECTS er; ::GetWindowRect(ed, (LPRECT)&er);
-        int by = (int)(er.b - er.t) - 72;
+        by = (int)(er.b - er.t) - 72;
         if (by < 100) by = 378;
-        PostLClick(ed, 144, by);
+        g_btnGreenHit = FindGreenButton(ed, px, py) ? 1 : 0;
+        if (g_btnGreenHit) { bx = px; by = py; }
+        g_btnX = bx; g_btnY = by;
+        PostLClick(ed, bx, by);
         ::Sleep(3800);
 
         if (!IsWindowGone(ed))
@@ -2654,6 +2743,13 @@ void Route_SilentMoment(httplib::Server& svr)
             r["retmsg"] = (ret == 0) ? "ok" : err;
             r["text"] = text;
             r["images"] = (int)images.size();
+            r["pos"] = {
+                {"btnGreen", (int)silentpost::g_btnGreenHit},
+                {"btnX", (int)silentpost::g_btnX},
+                {"btnY", (int)silentpost::g_btnY},
+                {"camX", (int)silentpost::g_camX},
+                {"menuY", (int)silentpost::g_menuItemY}
+            };
             res.set_content(r.dump(), "application/json");
         });
     svr.Get("/Moment/Ready", [](const httplib::Request&, httplib::Response& res)
