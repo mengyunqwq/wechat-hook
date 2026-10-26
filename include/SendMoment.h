@@ -11,9 +11,11 @@ namespace httplib { class Server; }
 
 void Route_SendMoment(httplib::Server& svr);
 void Route_SendMomentCapture(httplib::Server& svr);
+void Route_SendMomentBiz(httplib::Server& svr);
 
 namespace WeixinMoment
 {
     // 返回 0 成功；-2 模块未加载；-3 单例为空；-4 虚表异常；-99 访问违例/未实现
-    int SendMoment(const std::string& text, int stage, std::string* diag, int variant = 0);
+    int SendMoment(const std::string& text, int stage, std::string* diag, int variant = 0,
+                   const std::string& wxid = std::string());
 }
