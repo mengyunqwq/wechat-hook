@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <intrin.h>
 #include "global.h"
 #include "SendMoment.h"
 #include <MinHook.h>   // MOMENT-CAPTURE: 勾住 mmsnspost 构造函数录真实参数
@@ -828,5 +829,144 @@ std::string BuildMomentXml(const std::string& text, const std::string& wxid, boo
          "<ContentObject><contentStyle>2</contentStyle><title></title><description></description><mediaList/></ContentObject>"
          "</TimelineObject>";
     return x;
+}
+
+
+// ── DISPATCH-CAPTURE：勾住 0x3C9080（任务投递/调用器），记录 5 个参数 ──────────
+namespace
+{
+    typedef int (*DispFn)(void*, void*, void*, void*, void*);
+    DispFn          g_dispOrig = nullptr;
+    bool            g_dispHooked = false;
+    volatile LONG   g_dispHits = 0;
+    volatile ULONGLONG g_dA[5] = {0,0,0,0,0};      // 原始参数
+    volatile ULONGLONG g_dV[5] = {0,0,0,0,0};      // 解引用后的值（参数多为 &slot）
+    volatile ULONGLONG g_dW[5] = {0,0,0,0,0};      // 再解一层（若是对象再取 +0）
+    volatile ULONGLONG g_dDispRcx = 0;             // rcx 指向结构的首 8 字节
+    volatile ULONGLONG g_f2 = 0, g_f4 = 0;
+    volatile ULONGLONG g_f2_368 = 0, g_f4_368 = 0;
+    volatile ULONGLONG g_f2_350 = 0, g_f4_350 = 0;
+    volatile LONG      g_fHits = 0;
+    volatile ULONGLONG g_retRva = 0;
+
+    int DispDetour(void* a, void* b, void* c, void* d, void* e)
+    {
+        __try
+        {
+            void* p[5] = { a, b, c, d, e };
+            for (int i = 0; i < 5; ++i)
+            {
+                g_dA[i] = (ULONGLONG)(uintptr_t)p[i];
+                g_dV[i] = 0;
+                g_dW[i] = 0;
+                if (!p[i]) continue;
+                __try { g_dV[i] = *(volatile ULONGLONG*)p[i]; } __except (1) {}
+                ULONGLONG v = g_dV[i];
+                if (v >= 0x10000) { __try { g_dW[i] = *(volatile ULONGLONG*)(uintptr_t)v; } __except (1) {} }
+            }
+            g_dDispRcx = 0;
+
+            // 只关心「调用者位于朋友圈代码区 0x4E0000~0x4F0000」的那一次投递
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            ULONGLONG retRva = 0;
+            if (base)
+            {
+                void* fr[24] = {0};
+                USHORT nf = RtlCaptureStackBackTrace(1, 24, fr, nullptr);
+                for (USHORT i = 0; i < nf; ++i)
+                {
+                    uintptr_t a = (uintptr_t)fr[i];
+                    if (a <= base) continue;
+                    ULONGLONG r = (ULONGLONG)(a - base);
+                    if (r >= 0x4E0000 && r < 0x4F0000) { retRva = r; break; }
+                }
+            }
+            if (retRva)
+            {
+                g_f2 = g_dV[2];
+                g_f4 = g_dV[4];
+                g_f2_368 = g_f4_368 = 0;
+                g_f2_350 = g_f4_350 = 0;
+                if (g_f2) {
+                    __try { g_f2_368 = *(volatile ULONGLONG*)((uintptr_t)g_f2 + 0x368); } __except (1) {}
+                    __try { g_f2_350 = *(volatile ULONGLONG*)((uintptr_t)g_f2 + 0x350); } __except (1) {}
+                }
+                if (g_f4) {
+                    __try { g_f4_368 = *(volatile ULONGLONG*)((uintptr_t)g_f4 + 0x368); } __except (1) {}
+                    __try { g_f4_350 = *(volatile ULONGLONG*)((uintptr_t)g_f4 + 0x350); } __except (1) {}
+                }
+                g_retRva = retRva;
+                InterlockedIncrement(&g_fHits);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        InterlockedIncrement(&g_dispHits);
+        return g_dispOrig(a, b, c, d, e);
+    }
+
+    bool InstallDispHook()
+    {
+        if (g_dispHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        LPVOID t = (LPVOID)(base + 0x3C9080);
+        if (MH_CreateHook(t, (LPVOID)&DispDetour, (LPVOID*)&g_dispOrig) != MH_OK) return false;
+        if (MH_EnableHook(t) != MH_OK) { MH_RemoveHook(t); return false; }
+        g_dispHooked = true;
+        return true;
+    }
+
+    bool RemoveDispHook()
+    {
+        if (!g_dispHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (base) { LPVOID t = (LPVOID)(base + 0x3C9080); MH_DisableHook(t); MH_RemoveHook(t); }
+        g_dispHooked = false; g_dispOrig = nullptr;
+        return true;
+    }
+
+    std::string DispJson()
+    {
+        char buf[900];
+        std::snprintf(buf, sizeof(buf),
+            "{\"hooked\":%s,\"hits\":%ld,"
+            "\"a\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],"
+            "\"v\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],"
+            "\"w\":[\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\",\"0x%llX\"],"
+            "\"fHits\":%ld,\"retRva\":\"0x%llX\",\"f2\":\"0x%llX\",\"f2_368\":\"0x%llX\",\"f2_350\":\"0x%llX\","
+            "\"f4\":\"0x%llX\",\"f4_368\":\"0x%llX\",\"f4_350\":\"0x%llX\"}",
+            g_dispHooked ? "true" : "false", (long)g_dispHits,
+            g_dA[0], g_dA[1], g_dA[2], g_dA[3], g_dA[4],
+            g_dV[0], g_dV[1], g_dV[2], g_dV[3], g_dV[4],
+            g_dW[0], g_dW[1], g_dW[2], g_dW[3], g_dW[4],
+            (long)g_fHits, g_retRva, g_f2, g_f2_368, g_f2_350, g_f4, g_f4_368, g_f4_350);
+        return std::string(buf);
+    }
+}
+
+void Route_SendMomentDispatch(httplib::Server& svr)
+{
+    svr.Post("/SendMoment/DispHook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallDispHook() : RemoveDispHook();
+            json r; r["ok"] = ok; r["hooked"] = g_dispHooked; r["hits"] = (long)g_dispHits;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/SendMoment/DispCapture", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_content(DispJson(), "application/json");
+        });
+    svr.Post("/SendMoment/DispCapture", [](const httplib::Request&, httplib::Response& res)
+        {
+            InterlockedExchange(&g_dispHits, 0);
+            InterlockedExchange(&g_fHits, 0);
+            g_f2 = g_f4 = 0; g_f2_368 = g_f4_368 = 0; g_f2_350 = g_f4_350 = 0;
+            for (int i = 0; i < 5; ++i) { g_dA[i] = g_dV[i] = g_dW[i] = 0; }
+            json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
 }
 

@@ -18,5 +18,6 @@ void RegisterRoutes(httplib::Server& svr)
     Route_SendMoment(svr);
     Route_SendMomentCapture(svr);
     Route_SendMomentBiz(svr);
+    Route_SendMomentDispatch(svr);
     Route_QueryDB(svr);
 }
