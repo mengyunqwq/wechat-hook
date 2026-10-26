@@ -1364,212 +1364,380 @@ void Route_MemScan(httplib::Server& svr)
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  AUTO-POST：进程内全自动发朋友圈（自己点 UI，机器人只需一次 HTTP 调用）
-//  内部 API 路线受限于微信的会话上下文（见文档第七节），故用「借道」：
-//  让微信自己走完发表流程，我们只负责点击与输入。全程程序化，无需人工。
+//  /Moment/Post —— 内部调用入口（UI 自动化已按用户要求移除）
+//
+//  当前状态：mmsnspost 构造函数会把请求投递给微信的"任务调度器"，
+//  任务对象的 +0x368 来自 dispatchObj->+0xf0->+0x20 —— 该 dispatchObj 是
+//  真实发表流程里现造的一次性会话对象，外部调用时为空，因此会崩溃。
+//  正在复刻这个调度器的数据结构（见 0xCC10A0 / 0x3CEED0 / 0x8397020 vtable）。
 // ═════════════════════════════════════════════════════════════════════════════
-namespace
-{
-    struct WinFind { DWORD pid; HWND hwnd; };
-    BOOL CALLBACK FindMainWndProc(HWND h, LPARAM lp)
-    {
-        WinFind* f = (WinFind*)lp;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid != f->pid) return TRUE;
-        RECT r;
-        if (!GetWindowRect(h, &r)) return TRUE;
-        if ((r.right - r.left) < 500 || (r.bottom - r.top) < 400) return TRUE;  // 排除小弹窗
-        wchar_t cls[128] = {0};
-        GetClassNameW(h, cls, 128);
-        if (!wcsstr(cls, L"QWindowIcon")) return TRUE;   // 只认主窗口类
-        f->hwnd = h;
-        return FALSE;
-    }
-
-    HWND FindMainWindow()
-    {
-        WinFind f;
-        f.pid = GetCurrentProcessId();
-        f.hwnd = nullptr;
-        EnumWindows(FindMainWndProc, (LPARAM)&f);
-        return f.hwnd;
-    }
-
-    void MouseClickAt(int x, int y, bool rightClick)
-    {
-        ::SetCursorPos(x, y);
-        ::Sleep(60);
-        if (rightClick)
-        {
-            ::mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-            ::Sleep(30);
-            ::mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-        }
-        else
-        {
-            ::mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-            ::Sleep(30);
-            ::mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-        }
-    }
-
-    bool SetClipboardTextW(const std::wstring& text)
-    {
-        if (!::OpenClipboard(nullptr)) return false;
-        ::EmptyClipboard();
-        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-        HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
-        bool ok = false;
-        if (h)
-        {
-            void* p = ::GlobalLock(h);
-            if (p)
-            {
-                ::memcpy(p, text.c_str(), bytes);
-                ::GlobalUnlock(h);
-                ok = (::SetClipboardData(CF_UNICODETEXT, h) != nullptr);
-            }
-            if (!ok) ::GlobalFree(h);
-        }
-        ::CloseClipboard();
-        return ok;
-    }
-
-    std::wstring Utf8ToWide(const std::string& s)
-    {
-        if (s.empty()) return std::wstring();
-        int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-        std::wstring w(n, L'\0');
-        ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-        return w;
-    }
-
-    void SendEsc()
-    {
-        INPUT in[2] = {};
-        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_ESCAPE;
-        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_ESCAPE; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        ::SendInput(2, in, sizeof(INPUT));
-    }
-
-    void SendCtrlV()
-    {
-        INPUT in[4] = {};
-        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_CONTROL;
-        in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 'V';
-        in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = 'V';    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
-        in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_CONTROL; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
-        ::SendInput(4, in, sizeof(INPUT));
-    }
-
-    // 在窗口内相对坐标点击
-    void ClickRel(HWND hwnd, int rx, int ry, bool rightClick, int waitMs)
-    {
-        RECT r;
-        ::GetWindowRect(hwnd, &r);
-        MouseClickAt(r.left + rx, r.top + ry, rightClick);
-        ::Sleep(waitMs);
-    }
-
-    int DoAutoPostOnce(const std::string& text, std::string* diag, int attempt);
-
-    int DoAutoPost(const std::string& text, std::string* diag)
-    {
-        int last = -1;
-        for (int i = 0; i < 2; ++i)
-        {
-            last = DoAutoPostOnce(text, diag, i);
-            if (last == 0) return 0;
-            if (diag) { *diag += ""; }
-            ::Sleep(1500);
-        }
-        return last;
-    }
-
-    int DoAutoPostOnce(const std::string& text, std::string* diag, int attempt)
-    {
-        HWND hwnd = FindMainWindow();
-        if (!hwnd) { if (diag) *diag = "{\"why\":\"no main window\"}"; return -1; }
-
-        RECT r;
-        ::GetWindowRect(hwnd, &r);
-        int w = r.right - r.left, h = r.bottom - r.top;
-        if (w < 500 || h < 400) { if (diag) *diag = "{\"why\":\"window too small\"}"; return -2; }
-
-        ::ShowWindow(hwnd, SW_SHOW);
-        ::ShowWindow(hwnd, SW_RESTORE);
-        ::SetForegroundWindow(hwnd);
-        ::Sleep(700);
-
-        // 清掉可能残留的发表编辑器：点「取消」。没有对话框时这一下落在动态页空白处，无害。
-        // （不能用 ESC —— 微信主窗口按 ESC 会被收进托盘）
-        ClickRel(hwnd, 390, 446, false, 700);
-
-        // 装 mmsnspost 捕获钩子并用命中数验证「真的发出去了」
-        bool hookOk = InstallMomentHook();
-        InterlockedExchange(&g_capHits, 0);
-
-        // 1) 发现 → 朋友圈
-        ClickRel(hwnd, 30, 240, false, 1200);
-        ClickRel(hwnd, 130, 103, false, 1500);
-        // 1.5) 再点一次「朋友圈」确保在动态页并拿到焦点
-        ClickRel(hwnd, 130, 103, false, 900);
-        // 2) 右键相机 → 发表
-        ClickRel(hwnd, 762, 55, true, 1200);
-        ClickRel(hwnd, 780, 103, false, 1900);
-        // 3) 输入框 + 粘贴
-        ClickRel(hwnd, 239, 149, false, 400);
-        if (!SetClipboardTextW(Utf8ToWide(text))) { if (diag) *diag = "{\"why\":\"clipboard failed\"}"; return -3; }
-        ::Sleep(250);
-        SendCtrlV();
-        ::Sleep(900);
-        // 4) 发表（点按钮后等真实命中）
-        ClickRel(hwnd, 343, 446, false, 1200);
-
-        bool hit = false;
-        for (int i = 0; i < 40 && !hit; ++i)   // 最多等 ~10 秒
-        {
-            if (g_capHits > 0) { hit = true; break; }
-            ::Sleep(250);
-        }
-
-        if (diag)
-        {
-            char b[320];
-            std::snprintf(b, sizeof(b),
-                "{\"win\":\"%dx%d\",\"textLen\":%d,\"hook\":%d,\"hits\":%ld,\"verified\":%d}",
-                w, h, (int)text.size(), hookOk ? 1 : 0, (long)g_capHits, hit ? 1 : 0);
-            *diag = b;
-        }
-        return hit ? 0 : -9;   // -9 = 点了但没捕获到真实发表
-    }
-}
-
 void Route_AutoPost(httplib::Server& svr)
 {
-    svr.Post("/Moment/Post", [](const httplib::Request& req, httplib::Response& res)
+    svr.Post("/Moment/Post", [](const httplib::Request&, httplib::Response& res)
         {
-            json resp;
-            json body;
-            try { body = json::parse(req.body); } catch (...) { body = json::object(); }
-            std::string text = body.value("text", "");
-            if (text.empty()) { resp["ret"] = -1; resp["retmsg"] = "text required"; res.set_content(resp.dump(), "application/json"); return; }
-
-            std::string diag = "{}";
-            int ret = DoAutoPost(text, &diag);
-            resp["ret"] = ret;
-            resp["retmsg"] = (ret == 0) ? "posted" : "failed";
-            try { resp["diag"] = json::parse(diag); } catch (...) { resp["diag"] = diag; }
-            res.set_content(resp.dump(), "application/json");
+            json r;
+            r["ret"] = -1001;
+            r["retmsg"] = "内部调用尚未打通（调度器复刻中，UI 自动化已移除）";
+            res.set_content(r.dump(), "application/json");
         });
-
     svr.Get("/Moment/Post", [](const httplib::Request&, httplib::Response& res)
         {
             json j;
-            j["note"] = "POST {text} 全自动发朋友圈（进程内自动操作 UI）";
-            j["hwnd"] = (unsigned long long)(uintptr_t)FindMainWindow();
+            j["ret"] = -1001;
+            j["note"] = "内部调用尚未打通；UI 自动化已移除";
             res.set_content(j.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  DISPATCHER-PROBE：勾住 0xCC10A0（调度器的虚方法），抓它的 this 与 this->+0xf0 链路
+//  目标：搞清楚任务对象 +0x368 的来源对象到底长什么样、怎么来的
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    typedef int (*DispFn5)(void*, void*, void*, void*, void*);
+    DispFn5 g_dpOrig = nullptr;
+    bool    g_dpHooked = false;
+    volatile LONG g_dpHits = 0;
+    volatile unsigned long long g_dpThis = 0, g_dpThisVt = 0;
+    volatile unsigned long long g_dpF0 = 0, g_dpF0Vt = 0;
+    volatile unsigned long long g_dpF0_20 = 0, g_dpF0_28 = 0, g_dpF0_30 = 0, g_dpF0_38 = 0;
+    volatile unsigned long long g_dpThis_1f0 = 0, g_dpThis_8 = 0;
+    volatile LONG g_dpMatched = 0;
+    volatile unsigned char g_dpF0Raw[0x60] = {0};
+
+    int DpDetour(void* a, void* b, void* c, void* d, void* e)
+    {
+        __try
+        {
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            uintptr_t th = (uintptr_t)a;
+            g_dpThis = th;
+            g_dpThisVt = 0; g_dpF0 = 0; g_dpF0Vt = 0;
+            g_dpF0_20 = g_dpF0_28 = g_dpF0_30 = g_dpF0_38 = 0;
+            g_dpThis_1f0 = 0; g_dpThis_8 = 0;
+            if (th && base)
+            {
+                __try { g_dpThisVt = *(unsigned long long*)th > base ? (*(unsigned long long*)th - base) : 0; } __except (1) {}
+                __try { g_dpThis_8 = *(unsigned long long*)(th + 8); } __except (1) {}
+                __try { g_dpThis_1f0 = *(unsigned long long*)(th + 0x1f0); } __except (1) {}
+                unsigned long long f0 = 0;
+                __try { f0 = *(unsigned long long*)(th + 0xf0); } __except (1) {}
+                g_dpF0 = f0;
+                // 只关心「调用栈里有朋友圈代码区 0x4E0000~0x4F0000 帧」的那次投递
+                bool interesting = false;
+                {
+                    void* fr[32] = {0};
+                    USHORT nf = RtlCaptureStackBackTrace(1, 32, fr, nullptr);
+                    for (USHORT i = 0; i < nf; ++i)
+                    {
+                        uintptr_t a = (uintptr_t)fr[i];
+                        if (a <= base) continue;
+                        unsigned long long r = (unsigned long long)(a - base);
+                        if (r >= 0x4E0000 && r < 0x4F0000) { interesting = true; break; }
+                    }
+                }
+                if (f0 > 0x10000 && interesting)
+                {
+                    __try { unsigned long long v = *(unsigned long long*)(uintptr_t)f0; g_dpF0Vt = (base && v > base) ? (v - base) : v; } __except (1) {}
+                    __try { g_dpF0_20 = *(unsigned long long*)((uintptr_t)f0 + 0x20); } __except (1) {}
+                    __try { g_dpF0_28 = *(unsigned long long*)((uintptr_t)f0 + 0x28); } __except (1) {}
+                    __try { g_dpF0_30 = *(unsigned long long*)((uintptr_t)f0 + 0x30); } __except (1) {}
+                    __try { g_dpF0_38 = *(unsigned long long*)((uintptr_t)f0 + 0x38); } __except (1) {}
+                }
+                g_dpMatched = 1;
+                if (f0 > 0x10000)
+                {
+                    for (int i = 0; i < 0x60; ++i)
+                    {
+                        unsigned char ch = 0;
+                        __try { ch = *((unsigned char*)(uintptr_t)f0 + i); } __except (1) { ch = 0xEE; }
+                        g_dpF0Raw[i] = ch;
+                    }
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        InterlockedIncrement(&g_dpHits);
+        return g_dpOrig(a, b, c, d, e);
+    }
+
+    bool InstallDpHook()
+    {
+        if (g_dpHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        LPVOID t = (LPVOID)(base + 0xCC10A0);
+        if (MH_CreateHook(t, (LPVOID)&DpDetour, (LPVOID*)&g_dpOrig) != MH_OK) return false;
+        if (MH_EnableHook(t) != MH_OK) { MH_RemoveHook(t); return false; }
+        g_dpHooked = true;
+        return true;
+    }
+
+    bool RemoveDpHook()
+    {
+        if (!g_dpHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (base) { LPVOID t = (LPVOID)(base + 0xCC10A0); MH_DisableHook(t); MH_RemoveHook(t); }
+        g_dpHooked = false; g_dpOrig = nullptr;
+        return true;
+    }
+
+    std::string DpJson()
+    {
+        static const char* HEX = "0123456789abcdef";
+        std::string rawHex;
+        for (int i = 0; i < 0x60; ++i) { rawHex += HEX[g_dpF0Raw[i] >> 4]; rawHex += HEX[g_dpF0Raw[i] & 0xF]; }
+        char b[900];
+        std::snprintf(b, sizeof(b),
+            "{\"hooked\":%s,\"hits\":%ld,"
+            "\"this\":\"0x%llX\",\"thisVtRva\":\"0x%llX\",\"this8\":\"0x%llX\",\"this1f0\":\"0x%llX\","
+            "\"f0\":\"0x%llX\",\"f0VtRva\":\"0x%llX\","
+            "\"matched\":%ld,\"f0_20\":\"0x%llX\",\"f0_28\":\"0x%llX\",\"f0_30\":\"0x%llX\",\"f0_38\":\"0x%llX\"}",
+            g_dpHooked ? "true" : "false", (long)g_dpHits,
+            g_dpThis, g_dpThisVt, g_dpThis_8, g_dpThis_1f0,
+            g_dpF0, g_dpF0Vt, (long)g_dpMatched, g_dpF0_20, g_dpF0_28, g_dpF0_30, g_dpF0_38);
+        std::string out(b);
+        out += ",\"f0raw\":\"" + rawHex + "\"}";
+        return out;
+    }
+}
+
+void Route_DispatcherProbe(httplib::Server& svr)
+{
+    svr.Post("/Debug/DpHook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallDpHook() : RemoveDpHook();
+            json r; r["ok"] = ok; r["hooked"] = g_dpHooked;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/DpProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_content(DpJson(), "application/json");
+        });
+    svr.Post("/Debug/DpProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            InterlockedExchange(&g_dpHits, 0);
+            json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  TASK-SRC-PROBE：勾 0x3CEED0（任务构造），第 5 个参数 r15 就是"任务字段来源对象"
+//  （= dispatchObj->+0xf0）。任务 +0x368/+0x370/+0x380 直接取它的 +0x20/+0x28/+0x30。
+//  只要 r15->+0x20 非空，这次就是朋友圈投递 —— 抓到它就知道要复刻什么对象。
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    typedef int (*TaskFn5)(void*, void*, void*, void*, void*);
+    TaskFn5 g_tsOrig = nullptr;
+    bool    g_tsHooked = false;
+    volatile LONG g_tsHits = 0, g_tsMatch = 0;
+    volatile unsigned long long g_tsSrc = 0, g_tsSrcVt = 0;
+    volatile unsigned long long g_ts20 = 0, g_ts28 = 0, g_ts30 = 0, g_ts38 = 0;
+    volatile unsigned long long g_tsTask = 0;
+    volatile unsigned char g_tsSrcRaw[0x80] = {0};
+    volatile unsigned char g_tsP20Raw[0x80] = {0};   // *(src+0x00) 对象
+    volatile unsigned char g_tsF20Raw[0x80] = {0};   // *(src+0x20) 对象
+    volatile unsigned long long g_tsP20Vt = 0, g_tsF20Vt = 0;
+    volatile unsigned long long g_tsP20 = 0;
+    // 覆盖用的"任务来源结构"：只有 +0x20 必须有效；其余按真实抓包填
+    volatile unsigned long long g_ctxObj = 0;      // 有效上下文对象（真实发表时捕获）
+    volatile LONG g_ctxOverride = 0;               // 1 = 对"空上下文"的调用做替换
+    unsigned char g_ctxSrc[0x80] = {0};            // 伪造的 src 结构（真实 src 的模板副本）
+    volatile LONG g_ctxHasTemplate = 0;
+    char g_ctxStr[64] = "co_with_timeout@/360";    // 常驻字符串（真实值）
+
+    int TsDetour(void* a, void* b, void* c, void* d, void* e)
+    {
+        __try
+        {
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            uintptr_t src = (uintptr_t)e;      // 第 5 个参数 = 来源对象
+            if (src > 0x10000)
+            {
+                unsigned long long v20 = 0;
+                __try { v20 = *(unsigned long long*)(src + 0x20); } __except (1) {}
+                if (v20 > 0x10000)             // 只有朋友圈任务的 +0x20 才是有效指针
+                {
+                    g_tsTask = (unsigned long long)(uintptr_t)a;
+                    g_tsSrc = src;
+                    g_tsSrcVt = 0;
+                    __try {
+                        unsigned long long vt = *(unsigned long long*)src;
+                        g_tsSrcVt = (base && vt > base) ? (vt - base) : vt;
+                    } __except (1) {}
+                    __try { g_ts20 = v20; } __except (1) {}
+                    __try { g_ts28 = *(unsigned long long*)(src + 0x28); } __except (1) {}
+                    __try { g_ts30 = *(unsigned long long*)(src + 0x30); } __except (1) {}
+                    __try { g_ts38 = *(unsigned long long*)(src + 0x38); } __except (1) {}
+                    for (int i = 0; i < 0x80; ++i)
+                    {
+                        unsigned char ch = 0;
+                        __try { ch = *((unsigned char*)src + i); } __except (1) { ch = 0xEE; }
+                        g_tsSrcRaw[i] = ch;
+                    }
+                    // 追 src+0x00 和 src+0x20 两个对象
+                    g_tsP20 = 0; g_tsP20Vt = 0; g_tsF20Vt = 0;
+                    __try { g_tsP20 = *(unsigned long long*)src; } __except (1) {}
+                    if (g_tsP20 > 0x10000)
+                    {
+                        __try { unsigned long long v = *(unsigned long long*)(uintptr_t)g_tsP20;
+                                g_tsP20Vt = (base && v > base) ? (v - base) : v; } __except (1) {}
+                        for (int i = 0; i < 0x80; ++i) {
+                            unsigned char ch = 0;
+                            __try { ch = *((unsigned char*)(uintptr_t)g_tsP20 + i); } __except (1) { ch = 0xEE; }
+                            g_tsP20Raw[i] = ch;
+                        }
+                    }
+                    if (v20 > 0x10000)
+                    {
+                        __try { unsigned long long v = *(unsigned long long*)(uintptr_t)v20;
+                                g_tsF20Vt = (base && v > base) ? (v - base) : v; } __except (1) {}
+                        for (int i = 0; i < 0x80; ++i) {
+                            unsigned char ch = 0;
+                            __try { ch = *((unsigned char*)(uintptr_t)v20 + i); } __except (1) { ch = 0xEE; }
+                            g_tsF20Raw[i] = ch;
+                        }
+                    }
+                    InterlockedExchange(&g_tsMatch, 1);
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+
+        // ★ 上下文覆盖：真实发表时把有效对象记下来；我们自己的调用 src+0x20 为空，
+        //   就换成「带有效上下文」的伪造 src，让任务对象 +0x368 落在合法对象上。
+        if (g_ctxOverride)
+        {
+            void* e2 = e;
+            __try
+            {
+                uintptr_t src = (uintptr_t)e;
+                unsigned long long v20 = 0;
+                if (src > 0x10000) { __try { v20 = *(unsigned long long*)(src + 0x20); } __except (1) {} }
+                if (v20 > 0x10000)
+                {
+                    g_ctxObj = v20;   // 记住真实上下文对象
+                    // 把整个真实 src 拷成模板（含字符串头/长度/容量/+0x38/+0x40）
+                    for (int i = 0; i < 0x80; ++i)
+                    {
+                        unsigned char ch = 0;
+                        __try { ch = *((unsigned char*)src + i); } __except (1) { ch = 0; }
+                        g_ctxSrc[i] = ch;
+                    }
+                    // 字符串缓冲换成常驻副本，避免原 buffer 释放后悬空
+                    ::strncpy(g_ctxStr, "co_with_timeout@/360", sizeof(g_ctxStr) - 1);
+                    *(unsigned long long*)(g_ctxSrc + 0x00) = (unsigned long long)(uintptr_t)g_ctxStr;
+                    InterlockedExchange(&g_ctxHasTemplate, 1);
+                }
+                else if (v20 <= 0x10000 && g_ctxHasTemplate)
+                {
+                    e2 = g_ctxSrc;    // 用真实 src 模板覆盖（+0x20 已是有效上下文）
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { e2 = e; }
+            InterlockedIncrement(&g_tsHits);
+            return g_tsOrig(a, b, c, d, e2);
+        }
+
+        InterlockedIncrement(&g_tsHits);
+        return g_tsOrig(a, b, c, d, e);
+    }
+
+    bool InstallTsHook()
+    {
+        if (g_tsHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        LPVOID t = (LPVOID)(base + 0x3CEED0);
+        if (MH_CreateHook(t, (LPVOID)&TsDetour, (LPVOID*)&g_tsOrig) != MH_OK) return false;
+        if (MH_EnableHook(t) != MH_OK) { MH_RemoveHook(t); return false; }
+        g_tsHooked = true;
+        return true;
+    }
+
+    bool RemoveTsHook()
+    {
+        if (!g_tsHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (base) { LPVOID t = (LPVOID)(base + 0x3CEED0); MH_DisableHook(t); MH_RemoveHook(t); }
+        g_tsHooked = false; g_tsOrig = nullptr;
+        return true;
+    }
+
+    std::string TsJson()
+    {
+        static const char* HEX = "0123456789abcdef";
+        std::string raw, p20raw, f20raw;
+        for (int i = 0; i < 0x80; ++i) {
+            raw += HEX[g_tsSrcRaw[i] >> 4]; raw += HEX[g_tsSrcRaw[i] & 0xF];
+            p20raw += HEX[g_tsP20Raw[i] >> 4]; p20raw += HEX[g_tsP20Raw[i] & 0xF];
+            f20raw += HEX[g_tsF20Raw[i] >> 4]; f20raw += HEX[g_tsF20Raw[i] & 0xF];
+        }
+        char b[700];
+        std::snprintf(b, sizeof(b),
+            "{\"hooked\":%s,\"hits\":%ld,\"match\":%ld,"
+            "\"task\":\"0x%llX\",\"src\":\"0x%llX\",\"srcVtRva\":\"0x%llX\","
+            "\"f20\":\"0x%llX\",\"f28\":\"0x%llX\",\"f30\":\"0x%llX\",\"f38\":\"0x%llX\"",
+            g_tsHooked ? "true" : "false", (long)g_tsHits, (long)g_tsMatch,
+            g_tsTask, g_tsSrc, g_tsSrcVt, g_ts20, g_ts28, g_ts30, g_ts38);
+        std::string out(b);
+        char b2[256];
+        std::snprintf(b2, sizeof(b2), ",\"p20\":\"0x%llX\",\"p20VtRva\":\"0x%llX\",\"f20VtRva\":\"0x%llX\"",
+                      g_tsP20, g_tsP20Vt, g_tsF20Vt);
+        out += b2;
+        out += ",\"srcRaw\":\"" + raw + "\"";
+        out += ",\"p20Raw\":\"" + p20raw + "\"";
+        out += ",\"f20Raw\":\"" + f20raw + "\"}";
+        return out;
+    }
+}
+
+void Route_TaskSrcProbe(httplib::Server& svr)
+{
+    svr.Post("/Debug/TsHook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallTsHook() : RemoveTsHook();
+            json r; r["ok"] = ok; r["hooked"] = g_tsHooked;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/TsProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_content(TsJson(), "application/json");
+        });
+    svr.Post("/Debug/CtxOverride", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            InterlockedExchange(&g_ctxOverride, body.value("on", true) ? 1 : 0);
+            json r; r["ok"] = true; r["override"] = (long)g_ctxOverride;
+            r["ctxObj"] = (unsigned long long)g_ctxObj;
+            r["hasTemplate"] = (long)g_ctxHasTemplate;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/CtxOverride", [](const httplib::Request&, httplib::Response& res)
+        {
+            json r; r["override"] = (long)g_ctxOverride;
+            r["ctxObj"] = (unsigned long long)g_ctxObj;
+            r["hasTemplate"] = (long)g_ctxHasTemplate;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Post("/Debug/TsProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            InterlockedExchange(&g_tsHits, 0);
+            InterlockedExchange(&g_tsMatch, 0);
+            g_tsSrc = 0; g_ts20 = 0;
+            json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
         });
 }
 

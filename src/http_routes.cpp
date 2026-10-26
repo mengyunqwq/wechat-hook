@@ -23,5 +23,7 @@ void RegisterRoutes(httplib::Server& svr)
     Route_SendMomentBizCall(svr);
     Route_MemScan(svr);
     Route_AutoPost(svr);
+    Route_DispatcherProbe(svr);
+    Route_TaskSrcProbe(svr);
     Route_QueryDB(svr);
 }
