@@ -16,5 +16,6 @@ void RegisterRoutes(httplib::Server& svr)
     Route_SendImageMsg(svr);
     Route_SendVoiceMsg(svr);
     Route_SendMoment(svr);
+    Route_SendMomentCapture(svr);
     Route_QueryDB(svr);
 }

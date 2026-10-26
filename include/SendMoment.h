@@ -10,6 +10,7 @@
 namespace httplib { class Server; }
 
 void Route_SendMoment(httplib::Server& svr);
+void Route_SendMomentCapture(httplib::Server& svr);
 
 namespace WeixinMoment
 {

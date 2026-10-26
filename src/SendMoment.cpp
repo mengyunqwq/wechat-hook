@@ -23,6 +23,7 @@
 #include <cstdio>
 #include "global.h"
 #include "SendMoment.h"
+#include <MinHook.h>   // MOMENT-CAPTURE: 勾住 mmsnspost 构造函数录真实参数
 
 using json = nlohmann::json;
 
@@ -146,14 +147,31 @@ namespace
 
     std::string DiagJson(uintptr_t base, void* singleton, void* p2, int stage, int ret)
     {
-        char buf[1536];
+        // 崩溃地址落在哪个模块？(0x400000 = MEMORY_BASIC_INFORMATION.AllocationBase 偏移)
+        uintptr_t exModule = 0;
+        if (g_exAddr)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((LPCVOID)g_exAddr, &mbi, sizeof(mbi)))
+                exModule = (uintptr_t)mbi.AllocationBase;
+        }
+        uintptr_t selfBase = (uintptr_t)GetModuleHandleA("version.dll");
+        if (!selfBase) selfBase = (uintptr_t)GetModuleHandleA("Weixin.dll");
+
+        char buf[1900];
         std::snprintf(buf, sizeof(buf),
-            "{\"base\":\"0x%llX\",\"singleton\":\"0x%llX\",\"p2\":\"0x%llX\","
+            "{\"base\":\"0x%llX\",\"selfBase\":\"0x%llX\",\"exModule\":\"0x%llX\","
+            "\"exIsSelf\":%d,\"exIsWeixin\":%d,"
+            "\"singleton\":\"0x%llX\",\"p2\":\"0x%llX\","
             "\"stage\":%d,\"variant\":%d,\"ret\":%d,\"ctorRva\":\"0x%llX\",\"singletonRva\":\"0x%llX\","
             "\"exCode\":\"0x%llX\",\"exAddr\":\"0x%llX\",\"exAddrRva\":\"0x%llX\",\"exAccess\":\"0x%llX\","
             "\"reg\":{\"rcx\":\"0x%llX\",\"rdx\":\"0x%llX\",\"r8\":\"0x%llX\",\"r9\":\"0x%llX\","
             "\"rsi\":\"0x%llX\",\"rdi\":\"0x%llX\",\"rsp\":\"0x%llX\",\"rbp\":\"0x%llX\"}",
             (unsigned long long)base,
+            (unsigned long long)selfBase,
+            (unsigned long long)exModule,
+            (exModule && selfBase && exModule == selfBase) ? 1 : 0,
+            (exModule && base && exModule == base) ? 1 : 0,
             (unsigned long long)(uintptr_t)singleton,
             (unsigned long long)(uintptr_t)p2,
             stage, g_lastVariant, ret,
@@ -249,6 +267,12 @@ int WeixinMoment::SendMoment(const std::string& text, int stage, std::string* di
     case 5:  p5.type = 1;                break;
     case 6:  p5.type = 0x10;             break;
     case 7:  p5.flag = 0;                break;
+    case 8:  break;                      // 故意不构造 P3（对照）
+    // ★ P1 在 +0x18 处有 std::string（buf@0x18 / size@0x28 / cap@0x30），
+    //   小函数 0x04EB3910 从这里把它拷进 P3+0x18 —— 正文很可能在这里而不是 P5
+    case 10: BuildMsString((char*)&p1 + 0x18, text); break;
+    case 11: BuildMsString((char*)&p1 + 0x18, text);
+             BuildMsString(p5.str, text); break;
     default: break;
     }
 
@@ -314,3 +338,261 @@ void Route_SendMoment(httplib::Server& svr)
             res.set_content(j.dump(), "application/json");
         });
 }
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MOMENT-CAPTURE：勾住 0x04EB0B90，让用户手动发一条朋友圈，把真实参数与调用栈全录下来
+//
+//  为什么这么做：调试器会被微信反调试干掉，但本 DLL 已经在进程内，
+//  MinHook 只是改函数入口跳转（和现有 send_message/xlog 的 hook 同一种技术），
+//  不会被反调试判定为"被调试"。录到的是真实 UI 发表流程的参数与栈，
+//  这样就不必再盲猜 P1..P5 的语义。
+// ═════════════════════════════════════════════════════════════════════════════
+typedef int (*MomentFn5T)(void*, void*, void*, void*, void*);
+
+namespace
+{
+    MomentFn5T      g_momentOrig = nullptr;
+    bool            g_momentHooked = false;
+    volatile LONG   g_capHits = 0;
+    volatile DWORD  g_capTid = 0;
+    volatile ULONGLONG g_capP[5] = {0,0,0,0,0};
+    volatile ULONG  g_capType = 0, g_capFlag = 0;
+    volatile ULONGLONG g_capTextSize = 0, g_capTextCap = 0;
+    char            g_capText[260] = {0};
+    volatile ULONGLONG g_capP1Size = 0, g_capP1Cap = 0;
+    char            g_capP1[260] = {0};
+    volatile int    g_capFrames = 0;
+    volatile int    g_p1Len = 0, g_p3Len = 0, g_p4Len = 0;
+    unsigned char   g_p1Raw[0x100] = {0};   // P1 原始字节
+    unsigned char   g_p3Raw[0x1C0] = {0};   // P3 原始字节（0x1A0 + 余量）
+    unsigned char   g_p4Raw[0x40]  = {0};   // P4 原始字节
+    volatile int    g_p3aLen = 0, g_p3bLen = 0;
+    unsigned char   g_p3aRaw[0x200] = {0};  // P3+0x10 指向对象
+    unsigned char   g_p3bRaw[0x200] = {0};  // P3+0x38 指向对象
+    volatile int    g_p1PostLen = 0;        // ★ 调用返回后的 P1（已构建的请求）
+    unsigned char   g_p1PostRaw[0x400] = {0};
+    volatile ULONGLONG g_capStack[20] = {0};
+
+    void SafeCopy(void* src, void* dst, int n, volatile int* pLen)
+    {
+        __try { for (int i = 0; i < n; ++i) ((unsigned char*)dst)[i] = ((const unsigned char*)src)[i]; *pLen = n; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { *pLen = 0; }
+    }
+
+    void TakeString(const void* base, size_t off, volatile ULONGLONG* pSize,
+                    volatile ULONGLONG* pCap, char* dst, size_t dstLen)
+    {
+        const char* p = (const char*)base + off;
+        size_t sz  = *(const size_t*)(p + 0x10);
+        size_t cap = *(const size_t*)(p + 0x18);
+        *pSize = sz;
+        *pCap  = cap;
+        if (sz > dstLen - 1) sz = dstLen - 1;
+        const char* src = (cap >= 0x10) ? *(const char**)p : p;
+        if (!src) return;
+        for (size_t i = 0; i < sz; ++i) dst[i] = src[i];
+        dst[sz] = 0;
+    }
+
+    int MomentDetourImpl(void* p1, void* p2, void* p3, void* p4, void* p5)
+    {
+        __try
+        {
+            g_capTid = GetCurrentThreadId();
+            g_capP[0] = (ULONGLONG)(uintptr_t)p1;
+            g_capP[1] = (ULONGLONG)(uintptr_t)p2;
+            g_capP[2] = (ULONGLONG)(uintptr_t)p3;
+            g_capP[3] = (ULONGLONG)(uintptr_t)p4;
+            g_capP[4] = (ULONGLONG)(uintptr_t)p5;
+
+            // 先做原始内存 dump（放在读字符串之前，避免后者异常把它们跳过）
+            if (p1) SafeCopy(p1, (void*)g_p1Raw, 0x100, &g_p1Len);
+            if (p3) SafeCopy(p3, (void*)g_p3Raw, 0x1C0, &g_p3Len);
+            if (p4) SafeCopy(p4, (void*)g_p4Raw, 0x40,  &g_p4Len);
+            if (p3)
+            {
+                void* q1 = *(void**)((char*)p3 + 0x10);
+                void* q2 = *(void**)((char*)p3 + 0x38);
+                if (q1) SafeCopy(q1, (void*)g_p3aRaw, 0x200, &g_p3aLen);
+                if (q2) SafeCopy(q2, (void*)g_p3bRaw, 0x200, &g_p3bLen);
+            }
+
+            // P5 = { DWORD type; DWORD flag; std::string text@+08; void* extra@+28 }
+            if (p5)
+            {
+                g_capType = *(ULONG*)p5;
+                g_capFlag = *((ULONG*)p5 + 1);
+                TakeString(p5, 0x08, &g_capTextSize, &g_capTextCap, g_capText, sizeof(g_capText));
+            }
+            // P1 +0x18 处也有一个 string（小函数会把它拷进 P3+0x18）
+            if (p1)
+            {
+                TakeString(p1, 0x18, &g_capP1Size, &g_capP1Cap, g_capP1, sizeof(g_capP1));
+            }
+
+            // 原始内存 dump：P1 / P3 / P4（含正文可能在 P3 内部）
+
+            // 真实调用栈（转成相对 Weixin.dll 的 RVA，只留模块内的帧）
+            void* frames[20] = {0};
+            USHORT n = RtlCaptureStackBackTrace(1, 20, frames, nullptr);
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            int k = 0;
+            for (USHORT i = 0; i < n && k < 20; ++i)
+            {
+                uintptr_t a = (uintptr_t)frames[i];
+                if (base && a >= base && a < base + 0x0AF0E000)
+                    g_capStack[k++] = a - base;
+            }
+            g_capFrames = k;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        InterlockedIncrement(&g_capHits);
+
+        int r = g_momentOrig(p1, p2, p3, p4, p5);
+        // ★ 调用返回后再 dump P1：此时 mmsnspost 请求已构建，序列化正文应在其中
+        if (p1) SafeCopy(p1, (void*)g_p1PostRaw, 0x400, &g_p1PostLen);
+        return r;
+    }
+
+    // 无 SEH 的包一层，保证对象展开不冲突
+    int MomentDetour(void* p1, void* p2, void* p3, void* p4, void* p5)
+    {
+        return MomentDetourImpl(p1, p2, p3, p4, p5);
+    }
+
+    bool InstallMomentHook()
+    {
+        if (g_momentHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        LPVOID target = (LPVOID)(base + offset::mmsnspost_ctor);
+        if (MH_CreateHook(target, (LPVOID)&MomentDetour, (LPVOID*)&g_momentOrig) != MH_OK)
+            return false;
+        if (MH_EnableHook(target) != MH_OK)
+        {
+            MH_RemoveHook(target);
+            return false;
+        }
+        g_momentHooked = true;
+        return true;
+    }
+
+    bool RemoveMomentHook()
+    {
+        if (!g_momentHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (base)
+        {
+            LPVOID target = (LPVOID)(base + offset::mmsnspost_ctor);
+            MH_DisableHook(target);
+            MH_RemoveHook(target);
+        }
+        g_momentHooked = false;
+        g_momentOrig = nullptr;
+        return true;
+    }
+
+    std::string CaptureJson()
+    {
+        std::string j = "{\"hooked\":";
+        j += g_momentHooked ? "true" : "false";
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+            ",\"hits\":%ld,\"tid\":%lu,\"type\":%lu,\"flag\":%lu,"
+            "\"p1\":\"0x%llX\",\"p2\":\"0x%llX\",\"p3\":\"0x%llX\",\"p4\":\"0x%llX\",\"p5\":\"0x%llX\"",
+            (long)g_capHits, (unsigned long)g_capTid,
+            (unsigned long)g_capType, (unsigned long)g_capFlag,
+            g_capP[0], g_capP[1], g_capP[2], g_capP[3], g_capP[4]);
+        j += buf;
+
+        j += ",\"textSize\":";
+        j += std::to_string((unsigned long long)g_capTextSize);
+        j += ",\"textCap\":";
+        j += std::to_string((unsigned long long)g_capTextCap);
+        j += ",\"text\":\"";
+        for (const char* p = g_capText; *p; ++p)
+        {
+            unsigned char c = (unsigned char)*p;
+            if (c == 0x22 || c == 0x5C) { j += (char)0x5C; j += (char)c; }
+            else if (c < 0x20) { char t[8]; std::snprintf(t, sizeof(t), "%04X", c); j += (char)0x5C; j += 'u'; j += t; }
+            else j += (char)c;
+        }
+        j += "\",\"p1Text\":\"";
+        for (const char* p = g_capP1; *p; ++p)
+        {
+            unsigned char c = (unsigned char)*p;
+            if (c == 0x22 || c == 0x5C) { j += (char)0x5C; j += (char)c; }
+            else if (c < 0x20) { char t[8]; std::snprintf(t, sizeof(t), "%04X", c); j += (char)0x5C; j += 'u'; j += t; }
+            else j += (char)c;
+        }
+        auto hexOf = [](const unsigned char* b, int n)
+        {
+            std::string h;
+            static const char* D = "0123456789abcdef";
+            for (int i = 0; i < n; ++i) { h += D[b[i] >> 4]; h += D[b[i] & 0xF]; }
+            return h;
+        };
+        j += "\",\"p1Raw\":\"";
+        j += hexOf(g_p1Raw, (int)g_p1Len);
+        j += "\",\"p3Raw\":\"";
+        j += hexOf(g_p3Raw, (int)g_p3Len);
+        j += "\",\"p4Raw\":\"";
+        j += hexOf(g_p4Raw, (int)g_p4Len);
+        j += "\",\"p3aRaw\":\"";
+        j += hexOf(g_p3aRaw, (int)g_p3aLen);
+        j += "\",\"p3bRaw\":\"";
+        j += hexOf(g_p3bRaw, (int)g_p3bLen);
+        j += "\",\"p1PostRaw\":\"";
+        j += hexOf(g_p1PostRaw, (int)g_p1PostLen);
+        j += "\",\"stack\":[";
+        for (int i = 0; i < g_capFrames; ++i)
+        {
+            char t[28];
+            std::snprintf(t, sizeof(t), "%s\"0x%llX\"", i ? "," : "", g_capStack[i]);
+            j += t;
+        }
+        j += "]}";
+        return j;
+    }
+}
+
+void Route_SendMomentCapture(httplib::Server& svr)
+{
+    // POST /SendMoment/Hook { "on": true|false }  —— 装上/卸下 mmsnspost 捕获钩子
+    svr.Post("/SendMoment/Hook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json resp;
+            json body;
+            try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallMomentHook() : RemoveMomentHook();
+            resp["ok"] = ok;
+            resp["hooked"] = g_momentHooked;
+            resp["hits"] = (long)g_capHits;
+            res.set_content(resp.dump(), "application/json");
+        });
+
+    // GET /SendMoment/Capture —— 读录制结果
+    svr.Get("/SendMoment/Capture", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_content(CaptureJson(), "application/json");
+        });
+
+    // POST /SendMoment/Capture  {"reset":true} —— 清空计数，重新录
+    svr.Post("/SendMoment/Capture", [](const httplib::Request&, httplib::Response& res)
+        {
+            InterlockedExchange(&g_capHits, 0);
+            g_capFrames = 0;
+            g_capText[0] = 0;
+            g_capP1[0] = 0;
+            g_capType = g_capFlag = 0;
+            g_capTextSize = g_capTextCap = g_capP1Size = g_capP1Cap = 0;
+            for (int i = 0; i < 5; ++i) g_capP[i] = 0;
+            json resp; resp["ok"] = true; resp["hits"] = 0;
+            res.set_content(resp.dump(), "application/json");
+        });
+}
+
