@@ -2367,6 +2367,111 @@ namespace silentpost
         return !::IsWindow(h) || !::IsWindowVisible(h);
     }
 
+    struct ChildCtx { int kind; HWND edit; HWND openBtn; };
+    std::wstring Utf8ToWideFile(const std::string& utf8);   // fwd
+
+    static BOOL CALLBACK ChildProc(HWND h, LPARAM lp)
+    {
+        ChildCtx* c = (ChildCtx*)lp;
+        wchar_t cls[128] = {0};
+        ::GetClassNameW(h, cls, 128);
+        if (!::IsWindowVisible(h)) return TRUE;
+        if (c->kind == 1)
+        {
+            if (::wcsicmp(cls, L"Edit") == 0) c->edit = h;
+        }
+        else
+        {
+            if (::wcsicmp(cls, L"Button") == 0)
+            {
+                wchar_t txt[128] = {0};
+                ::GetWindowTextW(h, txt, 128);
+                if (::wcsstr(txt, L"\u6253\u5F00") || ::wcsstr(txt, L"Open"))
+                    c->openBtn = h;
+            }
+        }
+        return TRUE;
+    }
+
+    HWND FindDialog()
+    {
+        struct C { HWND h; } c = { nullptr };
+        ::EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            DWORD pid = 0; ::GetWindowThreadProcessId(h, &pid);
+            if (pid != ::GetCurrentProcessId()) return TRUE;
+            wchar_t cls[64] = {0}; ::GetClassNameW(h, cls, 64);
+            if (::wcsicmp(cls, L"#32770") == 0 && ::IsWindowVisible(h))
+            {
+                ((C*)lp)->h = h; return FALSE;
+            }
+            return TRUE;
+        }, (LPARAM)&c);
+        return c.h;
+    }
+
+    bool FillFileDialog(HWND dlg, const std::vector<std::string>& paths)
+    {
+        std::wstring w;
+        for (size_t i = 0; i < paths.size(); ++i)
+        {
+            std::wstring one = Utf8ToWideFile(paths[i]);
+            if (one.empty()) continue;
+            if (paths.size() > 1) { if (!w.empty()) w += L' '; w += L'"' + one + L'"'; }
+            else w = one;
+        }
+        if (w.empty()) return false;
+
+        ChildCtx c1 = { 1, nullptr, nullptr };
+        ::EnumChildWindows(dlg, ChildProc, (LPARAM)&c1);
+        if (!c1.edit) return false;
+        ::SendMessageW(c1.edit, WM_SETTEXT, 0, (LPARAM)w.c_str());
+        ::Sleep(500);
+
+        ChildCtx c2 = { 2, nullptr, nullptr };
+        ::EnumChildWindows(dlg, ChildProc, (LPARAM)&c2);
+        if (c2.openBtn) { ::PostMessageW(c2.openBtn, BM_CLICK, 0, 0); return true; }
+        ::PostMessageW(dlg, WM_COMMAND, 1, 0);
+        return true;
+    }
+
+    HWND WaitEditor(HWND main, int tries)
+    {
+        DWORD pid = ::GetCurrentProcessId();
+        for (int i = 0; i < tries; ++i)
+        {
+            HWND ws[16]; int n = 0;
+            if (EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, ws, 16, &n))
+            {
+                for (int k = 0; k < n; ++k)
+                    if (ws[k] != main && ::IsWindowVisible(ws[k])) return ws[k];
+            }
+            ::Sleep(500);
+        }
+        return nullptr;
+    }
+
+    HWND WaitDialog(int tries)
+    {
+        for (int i = 0; i < tries; ++i)
+        {
+            HWND d = FindDialog();
+            if (d) return d;
+            ::Sleep(400);
+        }
+        return nullptr;
+    }
+
+    std::wstring Utf8ToWideFile(const std::string& utf8)
+    {
+        int n = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+        UINT cp = (n > 0) ? CP_UTF8 : 936;
+        n = ::MultiByteToWideChar(cp, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+        if (n <= 0) return std::wstring();
+        std::wstring w((size_t)n, 0);
+        ::MultiByteToWideChar(cp, 0, utf8.c_str(), (int)utf8.size(), &w[0], n);
+        return w;
+    }
+
     std::wstring Utf8ToWide(const std::string& utf8)
     {
         int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
@@ -2390,7 +2495,7 @@ namespace silentpost
     }
 
     // 返回值：0 成功；负数失败
-    int Post(const std::string& utf8Text, std::string* err)
+    int Post(const std::string& utf8Text, const std::vector<std::string>& images, std::string* err)
     {
         DWORD pid = ::GetCurrentProcessId();
         HWND ws[16]; int n = 0;
@@ -2405,23 +2510,61 @@ namespace silentpost
         PostLClick(main, 133, 104);
         ::Sleep(1800);
 
-        // ① 右键相机
-        PostRClick(main, 762, 55);
-        ::Sleep(1500);
+        HWND ed = nullptr;
+        if (images.empty())
+        {
+            // ① 右键相机（菜单偶发不弹 -> 重试 3 次）
+            HWND menus[8]; int mn = 0;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                PostRClick(main, 762, 55);
+                ::Sleep(1700);
+                if (EnumWinsByClass(pid, L"Qt51514QWindowToolSaveBits", 100, 600, menus, 8, &mn) && mn > 0) break;
+                PostLClick(main, 133, 104);      // 重新点一下朋友圈，恢复页面状态
+                ::Sleep(1500);
+            }
+            if (mn == 0)
+            { if (err) *err = "no menu (camera icon not found?)"; return -2; }
+            PostLClick(menus[0], 105, 88);
+            ::Sleep(2400);
 
-        // ② 菜单
-        HWND menus[8]; int mn = 0;
-        if (!EnumWinsByClass(pid, L"Qt51514QWindowToolSaveBits", 100, 600, menus, 8, &mn) || mn == 0)
-        { if (err) *err = "no menu (camera icon not found?)"; return -2; }
-        PostLClick(menus[0], 105, 88);       // 发表文字
-        ::Sleep(2400);
+            // ③ 编辑器
+            HWND eds[8]; int en = 0;
+            if (!EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, eds, 8, &en) || en == 0)
+            { if (err) *err = "no editor"; return -3; }
+            ed = eds[0];
+            for (int i = 0; i < en; ++i) if (eds[i] != main) { ed = eds[i]; break; }
+        }
+        else
+        {
+            // ① 右键相机（菜单偶发不弹 -> 重试 3 次）
+            HWND menus[8]; int mn = 0;
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                PostRClick(main, 762, 55);
+                ::Sleep(1700);
+                if (EnumWinsByClass(pid, L"Qt51514QWindowToolSaveBits", 100, 600, menus, 8, &mn) && mn > 0) break;
+                PostLClick(main, 133, 104);
+                ::Sleep(1500);
+            }
+            if (mn == 0)
+            { if (err) *err = "no menu (camera icon not found?)"; return -2; }
 
-        // ③ 编辑器（宽度 250~700，且不是主窗口）
-        HWND eds[8]; int en = 0;
-        if (!EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, eds, 8, &en) || en == 0)
-        { if (err) *err = "no editor"; return -3; }
-        HWND ed = eds[0];
-        for (int i = 0; i < en; ++i) if (eds[i] != main) { ed = eds[i]; break; }
+            // ② 菜单 -> 选照片或视频（第一项）
+            PostLClick(menus[0], 105, 45);
+            ::Sleep(2500);
+
+            // ③ 文件对话框 -> 填路径 -> 打开
+            HWND dlg = WaitDialog(15);
+            if (!dlg) { if (err) *err = "no file dialog"; return -6; }
+            if (!FillFileDialog(dlg, images)) { if (err) *err = "fill file dialog failed"; return -7; }
+            ::Sleep(3200);
+
+            // ④ 编辑器
+            ed = WaitEditor(main, 20);
+            if (!ed) { if (err) *err = "no editor (image rejected?)"; return -8; }
+            ::Sleep(1500);
+        }
 
         // 清空
         for (int i = 0; i < 40; ++i) { ::PostMessageW(ed, WM_CHAR, 8, 1); ::Sleep(25); }
@@ -2439,9 +2582,12 @@ namespace silentpost
         }
         ::Sleep(700);
 
-        // ④ 点发表
-        PostLClick(ed, 145, 378);
-        ::Sleep(3500);
+        // ⑤ 点发表（按钮距底部固定 72px；有图时编辑器更高）
+        RECTS er; ::GetWindowRect(ed, (LPRECT)&er);
+        int by = (int)(er.b - er.t) - 72;
+        if (by < 100) by = 378;
+        PostLClick(ed, 144, by);
+        ::Sleep(3800);
 
         if (!IsWindowGone(ed))
         { if (err) *err = "editor still open (publish may have failed)"; return -5; }
@@ -2455,13 +2601,36 @@ void Route_SilentMoment(httplib::Server& svr)
         {
             json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
             std::string text = body.value("text", "");
-            if (text.empty()) { json r; r["ret"] = -400; r["retmsg"] = "empty text"; res.set_content(r.dump(), "application/json"); return; }
+            std::vector<std::string> images;
+            if (body.contains("images") && body["images"].is_array())
+            {
+                for (const auto& v : body["images"])
+                    if (v.is_string()) images.push_back(v.get<std::string>());
+            }
+            if (text.empty() && images.empty())
+            { json r; r["ret"] = -400; r["retmsg"] = "empty text and images"; res.set_content(r.dump(), "application/json"); return; }
             std::string err;
-            int ret = silentpost::Post(text, &err);
+            int ret = silentpost::Post(text, images, &err);
             json r;
             r["ret"] = ret;
             r["retmsg"] = (ret == 0) ? "ok" : err;
             r["text"] = text;
+            r["images"] = (int)images.size();
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Moment/Ready", [](const httplib::Request&, httplib::Response& res)
+        {
+            // 体检：主窗口 + 是否已有编辑器打开（供面板状态显示）
+            DWORD pid = ::GetCurrentProcessId();
+            HWND ws[16]; int n = 0;
+            bool hasMain = silentpost::EnumWinsByClass(pid, L"Qt51514QWindowIcon", 700, 4000, ws, 16, &n) && n > 0;
+            HWND eds[8]; int en = 0;
+            bool hasEditor = silentpost::EnumWinsByClass(pid, L"Qt51514QWindowIcon", 250, 700, eds, 8, &en) && en > 0;
+            json r;
+            r["ok"] = hasMain;
+            r["main"] = hasMain ? (unsigned long long)(uintptr_t)ws[0] : 0;
+            r["editor"] = hasEditor ? (unsigned long long)(uintptr_t)eds[0] : 0;
+            r["flow"] = "右键相机 → 发表文字 → WM_CHAR(UTF-16) → 点发表";
             res.set_content(r.dump(), "application/json");
         });
     svr.Get("/Moment/PostSilent", [](const httplib::Request&, httplib::Response& res)
