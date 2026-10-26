@@ -90,6 +90,7 @@ namespace
     volatile DWORD     g_exCode = 0;
     volatile ULONG_PTR g_exAddr = 0;
     volatile ULONG_PTR g_exAccess = 0;
+    volatile ULONG_PTR g_exAddrRva = 0;
     volatile ULONG_PTR g_exRcx = 0, g_exRdx = 0, g_exR8 = 0, g_exR9 = 0;
     volatile ULONG_PTR g_exRsi = 0, g_exRdi = 0, g_exRsp = 0, g_exRbp = 0;
     volatile ULONG_PTR g_stack[12] = {0};   // 栈上落在 Weixin.dll 内的返回地址（RVA）
@@ -122,6 +123,10 @@ namespace
             g_exAddr = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
             if (ep->ExceptionRecord->NumberParameters >= 2)
                 g_exAccess = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
+            {
+                uintptr_t b = (uintptr_t)GetModuleHandleA("Weixin.dll");
+                g_exAddrRva = (b && g_exAddr > b) ? (g_exAddr - b) : 0;
+            }
         }
         if (ep && ep->ContextRecord)
         {
@@ -706,6 +711,7 @@ void Route_SendMomentCapture(httplib::Server& svr)
 // ── BIZ-CAPTURE：勾住业务层 0x04EAE7F0(rcx=对象, rdx=&结构)，看"内容"从哪来 ──
 namespace
 {
+    extern volatile unsigned long long g_svcObj;
     typedef int (*BizFn)(void*, void*);
     BizFn           g_bizOrig = nullptr;
     bool            g_bizHooked = false;
@@ -724,6 +730,7 @@ namespace
         __try
         {
             g_bizRcx = (ULONGLONG)(uintptr_t)rcx;
+            if (rcx) g_svcObj = (unsigned long long)(uintptr_t)rcx;   // 供 /Moment/Internal 使用
             g_bizRdx = (ULONGLONG)(uintptr_t)rdx;
             if (rcx) SafeCopy(rcx, (void*)g_bizRcxRaw, 0x200, &g_bizRcxLen);
             if (rdx)
@@ -1739,6 +1746,269 @@ void Route_TaskSrcProbe(httplib::Server& svr)
             InterlockedExchange(&g_tsMatch, 0);
             g_tsSrc = 0; g_ts20 = 0;
             json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  XML-PROBE：勾 0x03EC68C0（TimelineObject XML 生成器），dump「草稿对象」
+//  调用点：0x04EAE893  mov rcx,[service+0x258] / lea rdx,&out / call 0x03EC68C0
+//  真实发表时草稿里带着正文 → dump 出来找字段偏移，就能"改草稿再走正规流程"
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    typedef int (*XmlFn2)(void*, void*);
+    XmlFn2 g_xmlOrig = nullptr;
+    bool   g_xmlHooked = false;
+    volatile LONG g_xmlHits = 0;
+    volatile unsigned long long g_xmlDraft = 0, g_xmlOut = 0;
+    volatile unsigned long long g_xmlDraftVt = 0;
+    volatile unsigned char g_xmlDraftRaw[0x300] = {0};
+
+    int XmlDetour(void* a, void* b)
+    {
+        __try
+        {
+            uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+            uintptr_t d = (uintptr_t)a;
+            if (d > 0x10000)
+            {
+                g_xmlDraft = d;
+                g_xmlOut = (unsigned long long)(uintptr_t)b;
+                g_xmlDraftVt = 0;
+                __try {
+                    unsigned long long vt = *(unsigned long long*)d;
+                    g_xmlDraftVt = (base && vt > base) ? (vt - base) : vt;
+                } __except (1) {}
+                for (int i = 0; i < 0x300; ++i)
+                {
+                    unsigned char ch = 0;
+                    __try { ch = *((unsigned char*)d + i); } __except (1) { ch = 0xEE; }
+                    g_xmlDraftRaw[i] = ch;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        InterlockedIncrement(&g_xmlHits);
+        return g_xmlOrig(a, b);
+    }
+
+    bool InstallXmlHook()
+    {
+        if (g_xmlHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return false;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
+        LPVOID t = (LPVOID)(base + 0x03EC68C0);
+        if (MH_CreateHook(t, (LPVOID)&XmlDetour, (LPVOID*)&g_xmlOrig) != MH_OK) return false;
+        if (MH_EnableHook(t) != MH_OK) { MH_RemoveHook(t); return false; }
+        g_xmlHooked = true;
+        return true;
+    }
+
+    bool RemoveXmlHook()
+    {
+        if (!g_xmlHooked) return true;
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (base) { LPVOID t = (LPVOID)(base + 0x03EC68C0); MH_DisableHook(t); MH_RemoveHook(t); }
+        g_xmlHooked = false; g_xmlOrig = nullptr;
+        return true;
+    }
+
+    std::string XmlJson()
+    {
+        static const char* HEX = "0123456789abcdef";
+        std::string raw;
+        for (int i = 0; i < 0x300; ++i) { raw += HEX[g_xmlDraftRaw[i] >> 4]; raw += HEX[g_xmlDraftRaw[i] & 0xF]; }
+        char b[300];
+        std::snprintf(b, sizeof(b),
+            "{\"hooked\":%s,\"hits\":%ld,\"draft\":\"0x%llX\",\"draftVtRva\":\"0x%llX\",\"out\":\"0x%llX\"",
+            g_xmlHooked ? "true" : "false", (long)g_xmlHits, g_xmlDraft, g_xmlDraftVt, g_xmlOut);
+        std::string out(b);
+        out += ",\"draftRaw\":\"" + raw + "\"}";
+        return out;
+    }
+}
+
+void Route_XmlProbe(httplib::Server& svr)
+{
+    svr.Post("/Debug/XmlHook", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            bool on = body.value("on", true);
+            bool ok = on ? InstallXmlHook() : RemoveXmlHook();
+            json r; r["ok"] = ok; r["hooked"] = g_xmlHooked;
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Debug/XmlProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            res.set_content(XmlJson(), "application/json");
+        });
+    svr.Post("/Debug/XmlProbe", [](const httplib::Request&, httplib::Response& res)
+        {
+            InterlockedExchange(&g_xmlHits, 0);
+            g_xmlDraft = 0;
+            json r; r["ok"] = true; res.set_content(r.dump(), "application/json");
+        });
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MOMENT-INTERNAL：改「草稿」正文，再走真实业务层 0x04EAE7F0
+//
+//  依据（实测）：
+//    service->+0x258 = 草稿对象
+//    草稿+0x60 = 正文 std::string（buf@0x60 / size@0x70 / cap@0x78）
+//    业务层 0x04EAE7F0(rcx=service, rdx=&tempstruct) 会用草稿拼 XML 并发布
+//  这与"硬造请求"完全不同：走的是微信自己的管线，对象都是真的。
+// ═════════════════════════════════════════════════════════════════════════════
+namespace
+{
+    volatile unsigned long long g_svcObj = 0;     // 业务层 rcx（服务对象），由 BizHook 捕获
+    volatile LONG g_internalRet = 0x7FFFFFFF;
+
+    bool WriteDraftText(const char* text, unsigned long long* outDraft)
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base || !g_svcObj) return false;
+        uintptr_t svc = (uintptr_t)g_svcObj;
+        unsigned long long draft = 0;
+        __try { draft = *(unsigned long long*)(svc + 0x258); } __except (1) { return false; }
+        if (draft < 0x10000) return false;
+        if (outDraft) *outDraft = draft;
+
+        // 写 std::string @ draft+0x60
+        __try
+        {
+            char* p = (char*)(uintptr_t)draft + 0x60;
+            size_t n = text ? ::strlen(text) : 0;
+            // 先判断原缓冲是否堆（cap>=16）→ 不释放，直接覆盖（可能泄漏，但不影响功能）
+            if (n <= 15)
+            {
+                ::memcpy(p, text, n);
+                p[n] = 0;
+                *(size_t*)(p + 0x10) = n;
+                *(size_t*)(p + 0x18) = 15;
+            }
+            else
+            {
+                char* heap = new char[n + 1];
+                ::memcpy(heap, text, n); heap[n] = 0;
+                *(char**)p = heap;
+                *(size_t*)(p + 0x10) = n;
+                *(size_t*)(p + 0x18) = n;
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    // 在 UI 线程上：改草稿 → 调业务层
+    volatile unsigned long long g_internalDraft = 0;
+    char g_internalText[1024] = {0};
+
+    int DoInternalOnThisThread()
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA("Weixin.dll");
+        if (!base) return -2;
+        unsigned long long draft = 0;
+        if (!WriteDraftText(g_internalText, &draft)) return -3;
+        g_internalDraft = draft;
+
+        extern volatile unsigned long long g_svcObj;
+    typedef int (*BizFn)(void*, void*);
+        BizFn fn = (BizFn)(base + 0x04EAE7F0);
+        static char rdxbuf[0x300];
+        ::memset(rdxbuf, 0, sizeof(rdxbuf));
+        __try { return fn((void*)(uintptr_t)g_svcObj, rdxbuf); }
+        __except (RecordCrash(GetExceptionInformation()), EXCEPTION_EXECUTE_HANDLER) { return -99; }
+    }
+
+    LRESULT CALLBACK InternalWndProc(int nCode, WPARAM wParam, LPARAM lParam)
+    {
+        if (nCode >= 0 && InterlockedCompareExchange(&g_uiPending, 0, 1) == 1)
+        {
+            g_internalRet = DoInternalOnThisThread();
+            InterlockedExchange(&g_uiDone, 1);
+        }
+        return CallNextHookEx(g_uiHook, nCode, wParam, lParam);
+    }
+
+    int RunInternalOnUiThread(const std::string& text, std::string* diag)
+    {
+        if (text.size() >= sizeof(g_internalText)) { if (diag) *diag = "{\"why\":\"text too long\"}"; return -1; }
+        ::memcpy(g_internalText, text.c_str(), text.size() + 1);
+        if (!g_svcObj) { if (diag) *diag = "{\"why\":\"service object unknown (need one real post with BizHook on)\"}"; return -4; }
+
+        DWORD tid = FindUiThread();
+        if (!tid) { if (diag) *diag = "{\"why\":\"no ui tid\"}"; return -6; }
+        HWND hwnd = nullptr;
+        {
+            struct C9 { DWORD pid; HWND h; };
+            static C9 c9;
+            c9.pid = GetCurrentProcessId(); c9.h = nullptr;
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+                if (pid != ((C9*)lp)->pid) return TRUE;
+                wchar_t cls[128] = {0};
+                GetClassNameW(h, cls, 128);
+                if (!wcsstr(cls, L"QWindowIcon")) return TRUE;
+                RECT r; if (!GetWindowRect(h, &r)) return TRUE;
+                if ((r.right - r.left) < 500) return TRUE;
+                ((C9*)lp)->h = h; return FALSE;
+            }, (LPARAM)&c9);
+            hwnd = c9.h;
+        }
+        if (!hwnd) { if (diag) *diag = "{\"why\":\"no window\"}"; return -7; }
+
+        InterlockedExchange(&g_uiDone, 0);
+        InterlockedExchange(&g_uiPending, 1);
+        g_uiHook = SetWindowsHookExW(WH_CALLWNDPROC, InternalWndProc, (HINSTANCE)GetModuleHandleW(nullptr), tid);
+        if (!g_uiHook) { InterlockedExchange(&g_uiPending, 0); return -8; }
+        for (int i = 0; i < 30 && !g_uiDone; ++i)
+        {
+            SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 2000, nullptr);
+            if (g_uiDone) break;
+            ::Sleep(30);
+        }
+        if (g_uiHook) { UnhookWindowsHookEx(g_uiHook); g_uiHook = nullptr; }
+        InterlockedExchange(&g_uiPending, 0);
+
+        if (diag) {
+            char b[320];
+            std::snprintf(b, sizeof(b),
+                "{\"done\":%ld,\"ret\":%d,\"draft\":\"0x%llX\",\"svc\":\"0x%llX\","
+                "\"exRva\":\"0x%llX\",\"exAcc\":\"0x%llX\"}",
+                (long)g_uiDone, g_internalRet, g_internalDraft, g_svcObj,
+                (unsigned long long)g_exAddrRva, (unsigned long long)g_exAccess);
+            *diag = b;
+        }
+        return g_internalRet;
+    }
+}
+
+void Route_MomentInternal(httplib::Server& svr)
+{
+    // POST /Moment/Internal {"text":"..."} —— 改草稿 + 走真实业务层
+    svr.Post("/Moment/Internal", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json body; try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+            std::string text = body.value("text", "");
+            std::string diag = "{}";
+            int ret = RunInternalOnUiThread(text, &diag);
+            json r;
+            r["ret"] = ret;
+            r["retmsg"] = (ret == 0) ? "ok" : "failed";
+            try { r["diag"] = json::parse(diag); } catch (...) { r["diag"] = diag; }
+            res.set_content(r.dump(), "application/json");
+        });
+    svr.Get("/Moment/Internal", [](const httplib::Request&, httplib::Response& res)
+        {
+            json r;
+            r["svc"] = (unsigned long long)g_svcObj;
+            r["note"] = "需要先开 BizHook 并真实发表一次以捕获 service 对象";
+            res.set_content(r.dump(), "application/json");
         });
 }
 

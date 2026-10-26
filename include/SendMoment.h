@@ -19,6 +19,8 @@ void Route_MemScan(httplib::Server& svr);
 void Route_AutoPost(httplib::Server& svr);
 void Route_DispatcherProbe(httplib::Server& svr);
 void Route_TaskSrcProbe(httplib::Server& svr);
+void Route_XmlProbe(httplib::Server& svr);
+void Route_MomentInternal(httplib::Server& svr);
 
 namespace WeixinMoment
 {
