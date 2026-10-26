@@ -1979,10 +1979,17 @@ namespace
             char b[320];
             std::snprintf(b, sizeof(b),
                 "{\"done\":%ld,\"ret\":%d,\"draft\":\"0x%llX\",\"svc\":\"0x%llX\","
-                "\"exRva\":\"0x%llX\",\"exAcc\":\"0x%llX\"}",
+                "\"exRva\":\"0x%llX\",\"exAcc\":\"0x%llX\",\"stack\":[",
                 (long)g_uiDone, g_internalRet, g_internalDraft, g_svcObj,
                 (unsigned long long)g_exAddrRva, (unsigned long long)g_exAccess);
-            *diag = b;
+            std::string out(b);
+            for (int i = 0; i < g_stackN; ++i) {
+                char t[24];
+                std::snprintf(t, sizeof(t), "%s\"0x%llX\"", i ? "," : "", (unsigned long long)g_stack[i]);
+                out += t;
+            }
+            out += "]}";
+            *diag = out;
         }
         return g_internalRet;
     }
