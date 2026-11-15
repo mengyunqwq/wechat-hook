@@ -750,6 +750,12 @@ public:
   bool listen(const std::string &host, int port, int socket_flags = 0);
 
   bool is_running() const;
+
+  // ★ 2026-11-12 合成请求分发（供文件队列通道使用，详见实现处注释）
+  bool DispatchSynthetic(const std::string &method_in, const std::string &path_in,
+                         const std::string &req_body, std::string &res_body,
+                         int &res_status, Headers &res_headers);
+
   void wait_until_ready() const;
   void stop();
 
@@ -2408,9 +2414,12 @@ inline ssize_t select_read(socket_t sock, time_t sec, time_t usec) {
 
   return handle_EINTR([&]() { return poll(&pfd_read, 1, timeout); });
 #else
-#ifndef _WIN32
+  // ★ 2026-11-11 修复：Windows 的 fd_set 只有 FD_SETSIZE(64) 项，
+  //   而进程跑久了 socket 句柄会到 1480 → FD_SET 越界 → select 永远返回 0
+  //   → accept 永不执行 → 端口 LISTEN 但客户端卡在 SYN_RECEIVED。
+  //   修法：句柄超限时直接返回"可读"，让调用方去 accept；
+  //   配合下面把监听 socket 设为非阻塞，没连接时 accept 立刻返回 EAGAIN 并 continue。
   if (sock >= FD_SETSIZE) { return 1; }
-#endif
 
   fd_set fds;
   FD_ZERO(&fds);
@@ -2436,9 +2445,8 @@ inline ssize_t select_write(socket_t sock, time_t sec, time_t usec) {
 
   return handle_EINTR([&]() { return poll(&pfd_read, 1, timeout); });
 #else
-#ifndef _WIN32
   if (sock >= FD_SETSIZE) { return 1; }
-#endif
+
 
   fd_set fds;
   FD_ZERO(&fds);
@@ -5373,6 +5381,57 @@ inline bool Server::listen(const std::string &host, int port,
 
 inline bool Server::is_running() const { return is_running_; }
 
+inline bool Server::DispatchSynthetic(const std::string &method_in,
+                                     const std::string &path_in,
+                                     const std::string &req_body,
+                                     std::string &res_body, int &res_status,
+                                     Headers &res_headers) {
+  Request req;
+  Response res;
+
+  std::string m = method_in;
+  for (size_t i = 0; i < m.size(); i++) {
+    m[i] = static_cast<char>(toupper(static_cast<unsigned char>(m[i])));
+  }
+  req.method = m;
+  req.version = "HTTP/1.1";
+  req.body = req_body;
+  req.remote_addr = "127.0.0.1";
+  req.set_header("Content-Type", "application/json");
+
+  std::string path = path_in;
+  std::string::size_type qpos = path.find('?');
+  if (qpos != std::string::npos) {
+    detail::parse_query_text(path.substr(qpos + 1), req.params);
+    path = path.substr(0, qpos);
+  }
+  req.path = path;
+
+  const Handlers *hs = nullptr;
+  if (m == "GET") hs = &get_handlers_;
+  else if (m == "POST") hs = &post_handlers_;
+  else if (m == "PUT") hs = &put_handlers_;
+  else if (m == "PATCH") hs = &patch_handlers_;
+  else if (m == "DELETE") hs = &delete_handlers_;
+  else if (m == "OPTIONS") hs = &options_handlers_;
+  if (hs == nullptr) return false;
+
+  for (size_t i = 0; i < hs->size(); i++) {
+    if (std::regex_match(req.path, (*hs)[i].first)) {
+      Handler handler = (*hs)[i].second;
+      handler(req, res);
+      res_body = res.body;
+      res_status = res.status;
+      res_headers = res.headers;
+      return true;
+    }
+  }
+  res_status = 404;
+  res_body.clear();
+  return false;
+}
+
+
 inline void Server::wait_until_ready() const {
   while (!is_running() && !done_) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -5766,13 +5825,38 @@ inline int Server::bind_internal(const std::string &host, int port,
   }
 }
 
+// ── 2026-11-11 诊断：accept 循环内部埋点 ─────────────────────────────
+// 说明：这是临时诊断代码，定位"端口 LISTEN 但永远不 accept"到底卡在哪一步。
+inline void httplib_trace(const char *fmt, ...) {
+  static volatile LONG lastMs = 0;
+  char buf[512] = {0};
+  va_list ap;
+  va_start(ap, fmt);
+  _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+  va_end(ap);
+  char line[600] = {0};
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  sprintf_s(line, "[%02d:%02d:%02d.%03d][tid=%lu] %s\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            GetCurrentThreadId(), buf);
+  FILE *f = nullptr;
+  if (fopen_s(&f, "D:\\wxhook\\wx4110\\http-inner.log", "a") == 0 && f) {
+    fputs(line, f);
+    fflush(f);
+    fclose(f);
+  }
+}
+
 inline bool Server::listen_internal() {
   auto ret = true;
   is_running_ = true;
   auto se = detail::scope_exit([&]() { is_running_ = false; });
 
   {
+    httplib_trace("A: 建线程池前 svr_sock=%lld", (long long)svr_sock_);
     std::unique_ptr<TaskQueue> task_queue(new_task_queue());
+    httplib_trace("B: 线程池已建好");
 
     while (svr_sock_ != INVALID_SOCKET) {
 #ifndef _WIN32
@@ -5780,6 +5864,15 @@ inline bool Server::listen_internal() {
 #endif
         auto val = detail::select_read(svr_sock_, idle_interval_sec_,
                                        idle_interval_usec_);
+        {
+          static volatile LONG cnt = 0;
+          LONG c = InterlockedIncrement(&cnt);
+          if (val != 0 || (c % 200) == 1) {
+            httplib_trace("C: select=%lld (idle=%lds/%ldus) errno=%d",
+                          (long long)val, (long)idle_interval_sec_,
+                          (long)idle_interval_usec_, errno);
+          }
+        }
         if (val == 0) { // Timeout
           task_queue->on_idle();
           continue;
@@ -5788,6 +5881,7 @@ inline bool Server::listen_internal() {
       }
 #endif
       socket_t sock = accept(svr_sock_, nullptr, nullptr);
+      httplib_trace("D: accept -> %lld errno=%d", (long long)sock, errno);
 
       if (sock == INVALID_SOCKET) {
         if (errno == EMFILE) {

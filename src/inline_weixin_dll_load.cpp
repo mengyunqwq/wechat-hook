@@ -1,4 +1,4 @@
-#include <cstdint>
+﻿#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <Windows.h>
@@ -14,8 +14,10 @@
 
 // 前置声明（不 include db_mgr.h：那会带进 json/httplib，和 winsock 头顺序打架）
 namespace xmgr { void StartEarlyArmThread(); }
+namespace db_registry { void installKeyCaptureEarly(void* weixinBase); }
 #include <MinHook.h>
 #include "tools.h"
+#include "HookQueue.h"
 #include "HookManager.h"
 #include "json.hpp"
 #include "wx_ini_reader.h"
@@ -215,6 +217,13 @@ void Evt_WeixinLoad()
     
     DetectWxVersion();
 
+    // ★ 2026-11-12：**登录前**就在 sqlcipher key() 上装"被动抄密钥"钩子。
+    //   客户端登录时才打开各个加密库并调用 key()，装早一步才能抄到；
+    //   放到 DatabaseMgr 构造函数里（首次查库才跑）就晚了，一个都抄不到。
+    if (g_WxVersion == 0) {
+        db_registry::installKeyCaptureEarly((void*)g_hWeixinDll);
+    }
+
     // ── 二分：新版先只起 HTTP 服务，其余初始化全部跳过 ──
     if (g_WxVersion != 0) {
         if (!g_httpServer) {
@@ -222,6 +231,7 @@ void Evt_WeixinLoad()
             g_httpServer->Start("127.0.0.1", g_StartPort);
         }
         xmgr::StartEarlyArmThread();   // 二分第 2 步：加回 DB 钩子（open16/prepare）
+        hookq::Start();                // ★ 同上：文件队列通道
         OutputDebugStringA("[init] 新版：仅 HTTP 服务（二分模式）\n");
         return;
     }
@@ -251,6 +261,10 @@ void Evt_WeixinLoad()
         // 若确实需要远程访问，请自行加反向代理 + 鉴权，不要直接改回 0.0.0.0。
         g_httpServer->Start("127.0.0.1", g_StartPort);
     }
+    // ★ 2026-11-12：HTTP 服务端在 4.1.10.27 上不可用（fd_set 越界/WSAPoll 不可靠），
+    //   改用文件队列通道：桥写请求文件，这里轮询执行并写结果。两条通道并存，
+    //   桥会优先用能通的那条。
+    hookq::Start();
 #ifdef _DEBUG
     //xLog 日志
     // 启动时用特征模式重新定位所有偏移（微信升级后自动适配；失败则回退硬编码）

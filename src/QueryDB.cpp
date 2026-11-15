@@ -1,3 +1,4 @@
+#include "CrashLog.h"
 #include "httplib.h"
 #include "json.hpp"
 #include <windows.h>
@@ -93,7 +94,10 @@ void Route_QueryDB(httplib::Server& svr)
             std::string optDbName = reqJson.value("optDbName", "");         // MicroMsg.db
             std::string sql = reqJson.value("SQL", "");                     // 查询语句   SELECT * FROM ChatRoom LIMIT 10
 
+            crashlog::Note("DB execute ENTER db=%s sql=%.40s", optDbName.c_str(), sql.c_str());
             auto result = g_dbMgr.execute(optDbName, sql);
+            crashlog::Note("DB execute RETURN db=%s", optDbName.c_str());
+
 
 
             // 使用临界区保护数据库访问

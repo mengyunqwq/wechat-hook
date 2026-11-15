@@ -5,6 +5,9 @@
 #include <map>
 #include <mutex>
 
+// ★ 2026-11-12：登录前安装"被动抄密钥"钩子（实现见 db_mgr.cpp）
+namespace db_registry { void installKeyCaptureEarly(void* weixinBase); }
+
 namespace xmgr {
     // 尽早触发 DatabaseMgr 构造（起线程 + 延迟；DLL 加载时调用一次）
     void StartEarlyInitThread();

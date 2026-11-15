@@ -1,4 +1,5 @@
 #include "wx_send.h"
+#include "CrashLog.h"
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -1330,11 +1331,32 @@ namespace WeixinSend
         BuildSendParam2_Image(paramStruct);
 
         WeixinCall send_message = (WeixinCall)(WeixinDLL_baseAddr + offset::send_message);
+        crashlog::Note("IMAGE send_message ENTER msgStruct=%p struct2=%p param=%p", msgStruct, struct2, paramStruct);
         send_message((uint64_t)struct2, (uint64_t)paramStruct);
+        crashlog::Note("IMAGE send_message RETURN struct2=%p param=%p", struct2, paramStruct);
 
     }
 
 
+
+    /**
+     * UTF-8 字符数（不是字节数）。
+     *
+     * 为什么需要：微信的 WeixinString.length / TextMessage.msg_len 按**字符**计，
+     * 而我们以前写的是 std::string::size()（字节）。
+     * ASCII 两者相等所以看不出问题；中文一个字符 3 字节，
+     * 长度多算 3 倍 → 微信多读越界字节 → 界面上显示成一串 ◊。
+     */
+    inline size_t Utf8CharCount(const std::string& s)
+    {
+        size_t n = 0;
+        for (size_t i = 0; i < s.size(); i++)
+        {
+            // 0x80~0xBF 是 UTF-8 的续字节，不计入字符数
+            if (((unsigned char)s[i] & 0xC0) != 0x80) n++;
+        }
+        return n;
+    }
 
     void BuildTextMessage(uint64_t* ptr, const std::string& text, const std::string& wxid,
                           const std::string& atlist = std::string())
@@ -1353,6 +1375,9 @@ namespace WeixinSend
 
         SetWeixinString(&msg->receiver, wxid);
         SetWeixinString(&msg->content, text);
+        // 注：length 用**字节数**（SetWeixinString 里已按 src.size() 设置）。
+        // 2026-11-12 实测：改成字符数反而会把中文截断（"中文测◊◊"），
+        // 说明微信这里按字节计。保持字节长度。
         // ── 真 @ 的关键 ──
         // atlist 里放被 @ 的人的 wxid（多个用英文逗号分隔）。
         // 只有填了这个字段，被 @ 的人才会真的收到提醒（红点）；
@@ -1360,7 +1385,7 @@ namespace WeixinSend
         if (!atlist.empty()) {
             SetWeixinString(&msg->atlist, atlist);
         }
-        msg->msg_len = text.length();
+        msg->msg_len = text.size();            // 字节数（实测正确，勿改字符数）
         msg->type = 1;
     }
 
@@ -1434,7 +1459,9 @@ namespace WeixinSend
         BuildSendParam2_Text(arg2);
 
         WeixinCall send_message = (WeixinCall)(base + offset::send_message);
+        crashlog::Note("TEXT send_message ENTER arg1=%p arg2=%p", arg1, arg2);
         send_message((uint64_t)arg1, (uint64_t)arg2);
+        crashlog::Note("TEXT send_message RETURN arg1=%p arg2=%p", arg1, arg2);
     }
 
 
@@ -2152,7 +2179,10 @@ namespace WeixinSend
 
         uint32_t dur = durationMs;
         uint64_t out[2] = { 0, 0 };
+        crashlog::Note("VOICE factory ENTER call#%llu factory=%p", (unsigned long long)callNo, (void*)pi.factory);
         bool factoryOk = callFactory(pi.factory, out, &receiver, &str0, &dur, &arg5);
+        crashlog::Note("VOICE factory RETURN call#%llu ok=%d inner=%p outer=%p",
+                       (unsigned long long)callNo, (int)factoryOk, (void*)out[0], (void*)out[1]);
 
         uint64_t inner = out[0], outer = out[1];
         std::string str0Show = (mode == "bytes")
@@ -2269,8 +2299,12 @@ namespace WeixinSend
             BuildSendParam2_Text(arg2);
 
             int64_t sendRet = 0;
+            crashlog::Note("VOICE send_message ENTER call#%llu inner=%p outer=%p arg1=%p arg2=%p dur=%u",
+                           (unsigned long long)callNo, (void*)inner, (void*)outer,
+                           (void*)arg1, (void*)arg2, (unsigned)durationMs);
             bool sent = callSendMessage(pi.base + offset::send_message,
                                         (uint64_t)arg1, (uint64_t)arg2, &sendRet);
+            crashlog::Note("VOICE send_message RETURN call#%llu sent=%d", (unsigned long long)callNo, (int)sent);
             logLine("call#" + std::to_string(callNo) + " send_message=" + hexU64(pi.base + offset::send_message) +
                     " arg1=" + hexU64((uint64_t)arg1) + " arg2=" + hexU64((uint64_t)arg2) +
                     " " + (sent ? "returned" : "RAISED") + " ret=" + hexU64((uint64_t)sendRet));

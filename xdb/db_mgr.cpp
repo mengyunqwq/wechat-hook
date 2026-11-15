@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdio>
 #include <intrin.h>   // _ReturnAddress()：识别 SQL 入口的调用来源
 #include "xwechat_offsets.h"
@@ -58,6 +60,13 @@ namespace db_registry {
 std::atomic<uintptr_t> g_lastVfs{ 0 };   // 最近一次 vfs_find 的结果（诊断用）
 std::atomic<long long> g_connLockOk{ 0 };     // 成功拿到连接锁的次数
 std::atomic<long long> g_connLockNull{ 0 };   // db_mutex 为空/未生效的次数（锁没起作用）
+std::atomic<long long> g_connLockSerial{ 0 }; // 走"进程内串行锁"退路的次数（2026-11-04 新增）
+// ★ 2026-11-04 事故：微信 4.1.10.27 的连接不是 FULLMUTEX，db_mutex(db) 恒返回 NULL，
+//   于是每条 SQL 都**无锁直冲**客户端线程 → 语音解码风暴时把客户端自己的读请求挤掉，
+//   用户看到的是"微信聊天界面不显示消息"。
+//   退路：拿不到连接锁时，用一把进程内的递归互斥把**我们自己的**查询串起来
+//   （不能和客户端互斥，但足以保证"我们不并发轰库"）。
+std::recursive_mutex g_serialQueryMtx;
 
 // ── 连接级互斥（对齐 sqlite 自己的连接锁）────────────────────────
 // 背景：我们通过 sqlite3_api_routines 直接调 prepare/step/finalize，
@@ -74,20 +83,27 @@ public:
                 g_api->mutex_enter(m_mutex);
                 m_locked = true;
                 g_connLockOk.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                g_connLockNull.fetch_add(1, std::memory_order_relaxed);
+                return;
             }
+            g_connLockNull.fetch_add(1, std::memory_order_relaxed);
         } else {
-            g_connLockNull.fetch_add(1, std::memory_order_relaxed);   // 槽位缺失 → 锁没起作用
+            g_connLockNull.fetch_add(1, std::memory_order_relaxed);   // 槽位缺失
         }
+        // 退路：进不了客户端的连接锁 → 至少让我们自己的查询不并发（2026-11-04）
+        g_serialQueryMtx.lock();
+        m_serial = true;
+        g_connLockSerial.fetch_add(1, std::memory_order_relaxed);
     }
     ~SqliteConnLock() {
         if (m_locked && g_api && g_api->mutex_leave) g_api->mutex_leave(m_mutex);
+        else if (m_serial) g_serialQueryMtx.unlock();
     }
     bool locked() const { return m_locked; }
+    bool serial() const { return m_serial; }
 private:
     sqlite3_mutex* m_mutex = nullptr;
     bool m_locked = false;
+    bool m_serial = false;   // 走的是进程内串行锁退路
 };
 
     // ── 计数器（热路径上只有一次 relaxed 自增/store）──────────────────
@@ -199,15 +215,75 @@ private:
 
     // 前向声明：safeDbName 定义在本命名空间后面（用 api->db_filename 只读取名）
     inline bool safeDbName(void* handle, std::string& out);
+    inline void notePathForRoot(const std::string& p);
 
     // ── 方案 A-2：在**客户端线程**里把每个库的 SQLCipher 密钥抓下来 ──
     //   为什么不在我们自己的线程调 codec_get_key：那等于又一次跨线程读客户端连接，
     //   实测会把客户端搞崩。这里只在客户端调用 prepare 的上下文里读一次（安全）。
     std::mutex g_keyMtx;
     std::map<std::string, std::string> g_keys;      // 库路径 → 原始密钥
+    // ★ 2026-11-12：key() 被调用的**那一瞬间**，db_filename 往往还拿不到名字
+    //   （实测 message_0.db 那批 nKey=99 的调用全部拿不到路径），
+    //   所以先按**句柄**存，等真正要用密钥时再用注册表里的 句柄→路径 反查配对。
+    std::map<void*, std::string> g_keyByHandle;
+
+    // ── 2026-11-11 可行性研究结论 + 实现 ─────────────────────────────
+    //   崩溃根因（符号化）：tryCaptureKey → codec_get_key(0x4EE64D0) → rip=0x0。
+    //   直接"整段停用"会让客户端启动期异常退出（已实测）——说明启动期还有别的
+    //   东西间接依赖它（own_db 的 SELECT 分流、名字判定等）。
+    //
+    //   可行方案 = 「验证式调用 + 挪出热路径」：
+    //     ① 函数指针四重验证：非空 / 可读 / 看起来像函数序言 / SEH 试调一次
+    //     ② 只在【低频】调用：open 登记时 + 全局每 60 秒最多一次（不在 noteHot）
+    //     ③ 任何一次验证失败 → g_keyCaptureBanned = true，本进程永不再试
+    //   这样即使偏移真的错了，也只是"抓不到密钥"，客户端绝不会崩。
+    std::atomic<bool> g_keyCaptureBanned{ false };       // 验证失败 → 永久禁用
+    std::atomic<long long> g_keyLastTryMs{ 0 };          // 全局限频（60s）
+    std::atomic<bool> g_keyFnValid{ false };             // 指针验证通过
+
+    /** 函数指针四重验证：返回 true 才允许真正调用 */
+    inline bool validateCodecFn() {
+        if (g_keyCaptureBanned.load(std::memory_order_relaxed)) return false;
+        void* fn = (void*)g_codecGetKeyFn;
+        if (fn == nullptr) { g_keyCaptureBanned.store(true); return false; }
+        // 可读性：MEMORY_BASIC_INFORMATION 确认是 COMMIT + EXECUTE/READ
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(fn, &mbi, sizeof(mbi))) { g_keyCaptureBanned.store(true); return false; }
+        const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (mbi.State != MEM_COMMIT || !(mbi.Protect & exec)) { g_keyCaptureBanned.store(true); return false; }
+        // 序言检查：常见函数开头（push rbp/sub rsp/mov/nop padding/jmp）
+        unsigned char b[6] = { 0 };
+        __try {
+            for (int i = 0; i < 6; i++) b[i] = ((unsigned char*)fn)[i];
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_keyCaptureBanned.store(true); return false; }
+        const bool looksLikeFn =
+            b[0] == 0x55 ||                                  // push rbp
+            b[0] == 0x48 || b[0] == 0x4C ||                  // REX.W 前缀（mov/sub…）
+            b[0] == 0xE9 || b[0] == 0xEB ||                  // jmp（stub/hook 过的）
+            b[0] == 0x90 ||                                  // nop padding
+            (b[0] == 0x40 || b[0] == 0x41);                  // REX 前缀族
+        if (!looksLikeFn) { g_keyCaptureBanned.store(true); return false; }
+        return true;
+    }
 
     inline void tryCaptureKey(void* db) {
-        if (g_WxVersion != 0) return;   // 新版 codec 偏移未适配：不抓密钥（会崩）`n        if (g_codecGetKeyFn == nullptr || db == nullptr) return;
+        if (g_keyCaptureBanned.load(std::memory_order_relaxed)) return;
+        if (g_WxVersion != 0) return;
+        if (g_codecGetKeyFn == nullptr || db == nullptr) return;
+        // ② 低频：60 秒最多试一次（不再是每条 SQL 都走）
+        const long long now = nowMs();
+        long long last = g_keyLastTryMs.load(std::memory_order_relaxed);
+        if (now - last < 60000LL) return;
+        if (!g_keyLastTryMs.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+        // ① 验证（失败一次 → 永久禁用）
+        if (!g_keyFnValid.load(std::memory_order_relaxed)) {
+            if (!validateCodecFn()) {
+                OutputDebugStringA("[keycap] codec_get_key 指针验证失败 → 本进程内永久禁用抓密钥\n");
+                return;
+            }
+            g_keyFnValid.store(true);
+            OutputDebugStringA("[keycap] codec_get_key 指针验证通过（已启用低频抓取）\n");
+        }
         std::string path;
         if (!safeDbName(db, path) || path.empty()) return;
         {
@@ -222,12 +298,378 @@ private:
         g_keys[path] = std::string((const char*)pKey, (size_t)nKey);
     }
 
-    inline bool keyForPath(const std::string& path, std::string& out) {
-        std::lock_guard<std::mutex> lg(g_keyMtx);
-        auto it = g_keys.find(path);
-        if (it == g_keys.end()) return false;
+    // ══════════════════════════════════════════════════════════════════
+    //  ★★ 2026-11-12 被动抄密钥（根治"借用客户端连接"）
+    //
+    //  背景：hook 查库时会二分——能开"自己的只读连接"就用自己，
+    //        开不了就回退用**客户端自己的 sqlite3\***。
+    //        实测（三次 dump 一致）：回退路径下密集查询会让微信走到
+    //        Weixin.dll+0x3290 那个 abort 桩 → 进程崩溃。
+    //        根因是同一个 sqlite3 连接被我们的线程和客户端线程并发使用。
+    //
+    //  以前拿密钥的办法是调 codec_get_key(0x4EE64D0)，那个偏移是错的，
+    //  208 次崩溃全是它（rip=0x0 EXECUTE）。不能再用。
+    //
+    //  新办法：**不主动要**，改成被动抄。
+    //        客户端每次开加密库都要调 sqlcipher_api_routines->key(db,pKey,nKey)，
+    //        我们在这函数上加一个"原样转发"的 detour，顺手把 pKey 的字节记下来。
+    //        只是 memcpy + map 插入，绝不调用任何未知偏移 → 零崩溃风险。
+    // ══════════════════════════════════════════════════════════════════
+    // ★ 2026-11-12：标记"这个 open 是 hook 自己发起的"。
+    //   hook 查库时会 open 自己的只读连接，如果这条路径也进 noteOpened/抓密钥，
+    //   会与注册表锁交叉（实测直接卡死队列线程）。自己开的连接不需要登记。
+    inline thread_local bool t_inOwnOpen = false;
+
+    struct OwnOpenScope {
+        bool prev;
+        OwnOpenScope() : prev(t_inOwnOpen) { t_inOwnOpen = true; }
+        ~OwnOpenScope() { t_inOwnOpen = prev; }
+    };
+
+    using SqcKeyFn = int (*)(sqlite3* db, const void* pKey, int nKey);
+    static SqcKeyFn g_origSqcKey = nullptr;
+    static std::atomic<bool> g_keyHookTried{ false };
+    static std::atomic<int>  g_keyCaptured{ 0 };
+
+    // ── keycap 落地日志（只写自己的文件，失败也不影响任何流程）──
+    inline void keycapLog(const char* fmt, ...)
+    {
+        char buf[512] = { 0 };
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        FILE* f = nullptr;
+        if (fopen_s(&f, "D:/wxhook/wx4110/keycap.log", "a") == 0 && f) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
+            fclose(f);
+        }
+    }
+
+    // ── SEH 壳：只做裸内存拷贝，函数内无任何 C++ 对象 ──
+    //   MSVC 限制：含析构对象的函数不能用 __try，所以把"可能抛 AV 的读"单独关起来。
+    static bool sehCopyKey(const void* src, int n, char* dst, int cap, int* got)
+    {
+        __try {
+            if (src != nullptr && n > 0 && n <= cap) {
+                memcpy(dst, src, (size_t)n);
+                *got = n;
+                return true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        return false;
+    }
+
+    // 只抄不改：任何异常都吞掉，绝不能影响客户端开库
+    // ★★ 关键：这个 detour 必须"零副作用"。
+    //
+    //  2026-11-12 第一次实现在持 g_keyMtx 时调了 safeDbName()，
+    //  而 safeDbName 会走注册表锁；另一条路径（keyForPath）又在持 g_keyMtx 时
+    //  调 nameForHandle —— 两边交叉 → **死锁**，队列线程卡死（req 文件不再被处理）。
+    //
+    //  现在：① 先无条件原样转发（客户端开库行为与本钩子无关）
+    //        ② 再纯内存抄一份（只碰 g_keyMtx，绝不调用任何外部函数）
+    static int detourSqcKey(sqlite3* db, const void* pKey, int nKey)
+    {
+        // ① 转发优先：保证客户端开库绝不被我们拖慢/拖死
+        const int rc = (g_origSqcKey != nullptr) ? g_origSqcKey(db, pKey, nKey) : 0;
+
+        // ② 抄密钥（短临界区，纯内存；异常一律吞掉，绝不影响客户端开库）
+        try {
+        if (db != nullptr && pKey != nullptr && nKey > 0 && nKey <= 256) {
+            char keybuf[256];
+            int got = 0;
+            if (sehCopyKey(pKey, nKey, keybuf, (int)sizeof(keybuf), &got) && got > 0) {
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> lg(g_keyMtx);
+                    if (g_keyByHandle.find((void*)db) == g_keyByHandle.end()) {
+                        g_keyByHandle[(void*)db] = std::string(keybuf, (size_t)got);
+                        g_keyCaptured.fetch_add(1, std::memory_order_relaxed);
+                        first = true;
+                    }
+                }
+                if (first) keycapLog("抄到密钥 handle=%p nKey=%d", (void*)db, got);
+            }
+        }
+        } catch (...) { }
+        return rc;
+    }
+
+    /** 在 sqlcipher key() 上装 passthrough 钩子（幂等，失败不影响任何功能） */
+    inline void installKeyCapture(sqlcipher_api_routines* sc)
+    {
+        if (sc == nullptr || sc->key == nullptr) return;
+        if (g_keyHookTried.exchange(true)) return;
+
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
+            keycapLog("MH_Initialize 失败 st=%d", (int)st);
+            return;
+        }
+        void* target = (void*)sc->key;
+        keycapLog("准备挂钩 sc=%p keyFn=%p", (void*)sc, target);
+        MH_STATUS c = MH_CreateHook(target, (LPVOID)&detourSqcKey, (LPVOID*)&g_origSqcKey);
+        if (c != MH_OK) {
+            keycapLog("MH_CreateHook(sqlcipher key) 失败 st=%d", (int)c);
+            return;
+        }
+        MH_STATUS e = MH_EnableHook(target);
+        if (e != MH_OK) {
+            keycapLog("MH_EnableHook 失败 st=%d", (int)e);
+            return;
+        }
+        keycapLog("钩子已生效（keyFn=%p）", target);
+    }
+
+    inline int capturedKeyCount() { return g_keyCaptured.load(std::memory_order_relaxed); }
+
+    /**
+     * ★ 2026-11-12 早期安装入口（必须在**登录前**调用）。
+     *
+     * 为什么必须有这个：原来只在 DatabaseMgr 构造函数里装钩子，
+     * 而构造函数是"首次查库"才跑的 —— 那时客户端早就把所有库打开、
+     * 密钥早就传给 key() 了，于是一个都抄不到（实测 registrations=39 但 0 密钥）。
+     * DLL 初始化阶段（version.dll 被加载时）就装，才能覆盖登录时的开库动作。
+     */
+    inline void installKeyCaptureEarlyImpl(void* weixinBase)
+    {
+        if (weixinBase == nullptr) return;
+        if (g_WxVersion != 0) return;   // 新版偏移不同，先不动
+        auto* sc = (sqlcipher_api_routines*)((size_t)weixinBase + XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET);
+        keycapLog("installKeyCaptureEarly: base=%p sc=%p", weixinBase, (void*)sc);
+        installKeyCapture(sc);
+    }
+
+    // 非 inline 包装：供别的编译单元（inline_weixin_dll_load.cpp）链接调用
+    void installKeyCaptureEarly(void* weixinBase)
+    {
+        installKeyCaptureEarlyImpl(weixinBase);
+    }
+
+    // nameForHandle 的前向声明（实现在下方 noteOpened 附近）
+    inline bool nameForHandle(void* handle, std::string& out);
+
+    // ── 短名 → 绝对路径（2026-11-12）─────────────────────────────────
+    //  客户端登记的名字常常是**短名**（"message_0.db"），
+    //  而 sqlite 的 open() 会按"当前工作目录"解析相对路径 →
+    //  实测在 D:\wxhook\wx4110\4.1.10.27\ 建出了 0 字节的假库。
+    //
+    //  做法：从任一已知的绝对路径里推出 ...\db_storage 这个根，
+    //        然后在 db_storage\<子目录>\<短名> 里找真正存在的那个。
+    //        找到一次就缓存，之后 O(1)。
+    // ★★ 2026-11-12：noteOpened 里原来用 baseName() 把路径截成了短名，
+    //   **完整路径丢掉了**，导致之后想给 sqlite 开自己的连接时只能拿到"message_0.db"
+    //   这种相对名（然后被解析到 CWD，建出 0 字节假库）。
+    //   这里把 open 时拿到的完整路径存下来，开自有连接时直接用。
+    static std::mutex g_fullPathMtx;
+    static std::map<void*, std::string> g_fullPath;
+
+    inline void rememberFullPath(void* handle, const std::string& raw)
+    {
+        if (handle == nullptr || raw.empty()) return;
+
+        // ★★ 2026-11-12：客户端开库时传进来的常常是**相对名**（如 "message_0.db"），
+        //   因为它在开库前会把 CWD 切到对应的 db_storage 子目录。
+        //   所以必须**在 open 的那一刻**用 GetFullPathNameA 解析成绝对路径——
+        //   晚一步 CWD 就变了，拿到的路径就错了。
+        std::string abs = raw;
+        if (!(raw.size() > 1 && raw[1] == ':')) {
+            char buf[MAX_PATH * 2] = { 0 };
+            DWORD n = GetFullPathNameA(raw.c_str(), (DWORD)sizeof(buf), buf, nullptr);
+            if (n == 0 || n >= sizeof(buf)) return;
+            abs = buf;
+        }
+        if (abs.size() < 3 || abs[1] != ':') return;
+
+        {
+            std::lock_guard<std::mutex> lg(g_fullPathMtx);
+            g_fullPath[handle] = abs;
+        }
+        keycapLog("记住路径 handle=%p raw=%s abs=%s", handle, raw.c_str(), abs.c_str());
+    }
+
+    inline bool fullPathForHandle(void* handle, std::string& out)
+    {
+        std::lock_guard<std::mutex> lg(g_fullPathMtx);
+        auto it = g_fullPath.find(handle);
+        if (it == g_fullPath.end() || it->second.empty()) return false;
         out = it->second;
         return true;
+    }
+
+    static std::string g_dbStorageRoot;
+    static std::map<std::string, std::string> g_pathByName;   // 短名 → 绝对路径
+
+    inline std::string learnRootFromAbsolute(const std::string& abs)
+    {
+        // 找 ...\db_storage\ 并把根截到这里
+        std::string low;
+        low.reserve(abs.size());
+        for (char c : abs) low.push_back((char)tolower((unsigned char)c));
+        const std::string tag = "\\db_storage\\";
+        size_t p = low.find(tag);
+        if (p == std::string::npos) return std::string();
+        return abs.substr(0, p + tag.size() - 1);   // 不含结尾反斜杠
+    }
+
+    /**
+     * 按短名在磁盘上找真实文件（有界搜索，结果缓存）。
+     *
+     * 为什么需要兜底：客户端注册句柄时只给了短名（"message_0.db"），
+     * db_filename() 也只返回短名；注册表里没有 WeChat 的数据目录。
+     * 但目录结构是固定的：<盘>:\Users\<用户>\xwechat_files\<wxid_*>\db_storage\<子目录>\<短名>
+     * 所以扫一层就够（各盘 Users\*、各账号、db_storage\*），找到即缓存。
+     */
+    inline std::string findDbByNameOnDisk(const std::string& name)
+    {
+        if (name.empty()) return std::string();
+
+        std::vector<std::string> userDirs;
+        char up[MAX_PATH] = { 0 };
+        if (GetEnvironmentVariableA("USERPROFILE", up, MAX_PATH) > 0) userDirs.push_back(up);
+        for (char d = 'C'; d <= 'Z'; d++) {
+            std::string pat = std::string(1, d) + ":\\Users\\*";
+            WIN32_FIND_DATAA fd{};
+            HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                    strcmp(fd.cFileName, ".") != 0 && strcmp(fd.cFileName, "..") != 0) {
+                    userDirs.push_back(std::string(1, d) + ":\\Users\\" + fd.cFileName);
+                }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+
+        int tried = 0;
+        for (size_t i = 0; i < userDirs.size(); i++) {
+            std::string accPat = userDirs[i] + "\\xwechat_files\\*";
+            WIN32_FIND_DATAA fd2{};
+            HANDLE h2 = FindFirstFileA(accPat.c_str(), &fd2);
+            if (h2 == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (strcmp(fd2.cFileName, ".") == 0 || strcmp(fd2.cFileName, "..") == 0) continue;
+                std::string ds = userDirs[i] + "\\xwechat_files\\" + fd2.cFileName + "\\db_storage";
+
+                std::string subPat = ds + "\\*";
+                WIN32_FIND_DATAA fd3{};
+                HANDLE h3 = FindFirstFileA(subPat.c_str(), &fd3);
+                if (h3 == INVALID_HANDLE_VALUE) continue;
+                do {
+                    if (!(fd3.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    if (strcmp(fd3.cFileName, ".") == 0 || strcmp(fd3.cFileName, "..") == 0) continue;
+                    std::string cand = ds + "\\" + fd3.cFileName + "\\" + name;
+                    tried++;
+                    DWORD a = GetFileAttributesA(cand.c_str());
+                    if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+                        FindClose(h3);
+                        FindClose(h2);
+                        keycapLog("磁盘定位成功: %s → %s（试了 %d 个）", name.c_str(), cand.c_str(), tried);
+                        return cand;
+                    }
+                } while (FindNextFileA(h3, &fd3));
+                FindClose(h3);
+            } while (FindNextFileA(h2, &fd2));
+            FindClose(h2);
+        }
+        keycapLog("磁盘定位失败: %s（试了 %d 个候选）", name.c_str(), tried);
+        return std::string();
+    }
+
+    /** 把短名解析成真实绝对路径；失败返回空串（调用方应拒绝开连接） */
+    inline std::string resolveDbPath(const std::string& nameOrPath)
+    {
+        if (nameOrPath.empty()) return std::string();
+        const bool isAbs = (nameOrPath.size() > 1 && nameOrPath[1] == ':');
+        if (isAbs) return nameOrPath;
+
+        {
+            std::lock_guard<std::mutex> lg(g_keyMtx);
+            auto it = g_pathByName.find(nameOrPath);
+            if (it != g_pathByName.end()) return it->second;
+        }
+
+        std::string root;
+        {
+            std::lock_guard<std::mutex> lg(g_keyMtx);
+            root = g_dbStorageRoot;
+        }
+        if (root.empty()) {
+            // 根目录未知 → 直接按短名在磁盘上找（有界搜索，找到即缓存）
+            std::string found = findDbByNameOnDisk(nameOrPath);
+            if (!found.empty()) {
+                std::lock_guard<std::mutex> lg(g_keyMtx);
+                g_pathByName[nameOrPath] = found;
+            }
+            return found;
+        }
+
+        static const char* kSub[] = {
+            "message", "contact", "session", "general", "sns", "favorite",
+            "emoticon", "biz", "hardlink", "head_image", "media", "solitaire"
+        };
+        for (size_t i = 0; i < sizeof(kSub) / sizeof(kSub[0]); i++) {
+            std::string cand = root + "\\" + kSub[i] + "\\" + nameOrPath;
+            DWORD a = GetFileAttributesA(cand.c_str());
+            if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::lock_guard<std::mutex> lg(g_keyMtx);
+                g_pathByName[nameOrPath] = cand;
+                keycapLog("短名定位成功: %s → %s", nameOrPath.c_str(), cand.c_str());
+                return cand;
+            }
+        }
+        keycapLog("短名定位失败（拒绝开连接）: %s", nameOrPath.c_str());
+        return std::string();
+    }
+
+    /** 记录一个绝对路径，用于学习 db_storage 根目录 */
+    inline void learnAbsolute(const std::string& absOrName)
+    {
+        if (absOrName.size() < 3 || absOrName[1] != ':') return;
+        std::lock_guard<std::mutex> lg(g_keyMtx);
+        if (!g_dbStorageRoot.empty()) return;
+        std::string r = learnRootFromAbsolute(absOrName);
+        if (!r.empty()) {
+            g_dbStorageRoot = r;
+            keycapLog("学到 db_storage 根: %s", r.c_str());
+        }
+    }
+
+    inline bool keyForPath(const std::string& path, std::string& out) {
+        // ① 快速命中（只在持锁期间做 map 查找）
+        {
+            std::lock_guard<std::mutex> lg(g_keyMtx);
+            auto it = g_keys.find(path);
+            if (it != g_keys.end()) { out = it->second; return true; }
+        }
+
+        // ② 反查配对：先复制快照，**到锁外**再问注册表（避免与 key() detour 交叉死锁）
+        std::vector<std::pair<void*, std::string>> snap;
+        {
+            std::lock_guard<std::mutex> lg(g_keyMtx);
+            snap.reserve(g_keyByHandle.size());
+            for (auto& kv : g_keyByHandle) snap.push_back(kv);
+        }
+        for (auto& kv : snap) {
+            std::string p;
+            // 注册表里存的是短名，而这里要的是绝对路径 → 两种都接受
+            if (nameForHandle(kv.first, p) && (p == path || baseName(p) == baseName(path))) {
+                {
+                    std::lock_guard<std::mutex> lg(g_keyMtx);
+                    g_keys[path] = kv.second;
+                }
+                out = kv.second;
+                keycapLog("密钥配对成功: %s（来自 handle=%p）", path.c_str(), kv.first);
+                return true;
+            }
+        }
+        return false;
     }
     // ★★ prepare detour 的**唯一**动作：记一条映射 ★★
     //   O(1)、无锁、不调 API、不读内存、不做 I/O、不打日志。
@@ -244,7 +686,8 @@ private:
         if (c != nullptr) {
             c->tick.store(nowMs(), std::memory_order_relaxed);
             g_registrations.fetch_add(1, std::memory_order_relaxed);
-        tryCaptureKey(db);   // 客户端线程里顺手抓密钥（方案 A-2，安全）
+            // ★ 2026-11-11：tryCaptureKey 从这里（每条 SQL 的热路径）移除。
+            //   改在 noteOpened（每次 open 低频）和 captureKeyTick（60s 一次）里做。
             g_lastRegMs.store(nowMs(), std::memory_order_relaxed);   // 新句柄出现（只在首次登记时写）
         }
     }
@@ -253,6 +696,8 @@ private:
     inline void noteOpened(void* db, const std::string& rawName) {
         const uintptr_t p = (uintptr_t)db;
         if (p == 0) return;
+        notePathForRoot(rawName);                  // ★ 顺手学习 db_storage 根（多数是绝对路径）
+        rememberFullPath((void*)db, rawName);      // ★★ 完整路径留着（开自有连接要用）
         std::string nm = baseName(rawName);
         if (!looksLikeDbName(nm)) nm.clear();
         const int idx = internName(nm);            // 低频路径，允许拿名字锁
@@ -260,7 +705,14 @@ private:
         if (s == nullptr) s = claimSlot(p);
         if (s == nullptr) return;
         if (idx > 0) s->name.store(idx, std::memory_order_relaxed);   // 地址被复用 → 以最新一次 open 为准
-        if (idx > 0) g_openNamed.fetch_add(1, std::memory_order_relaxed);
+        if (idx > 0) {
+            g_openNamed.fetch_add(1, std::memory_order_relaxed);
+            // ★ 2026-11-11：这里**不再**调 tryCaptureKey。
+            //   实测在 open detour 里抓密钥（要拿 g_keyMtx + 调 db_filename）
+            //   会和客户端持有的 sqlite 锁交叉 → 客户端初始化卡住、
+            //   hook 的 HTTP 只监听不响应（正是"hook 挂不上"的表现）。
+            //   密钥抓不到没有副作用：ownConnectionFor 会回退用客户端连接（原有设计）。
+        }
         s->src.store(1, std::memory_order_relaxed);
         s->fail.store(0, std::memory_order_relaxed);                  // 新连接：失败计数清零
         s->tick.store(nowMs(), std::memory_order_relaxed);
@@ -441,6 +893,9 @@ private:
     }
 
     // 句柄 → 库名（只用登记表，不碰客户端连接对象；比 db_filename 安全）
+    // 登记路径时顺手学习 db_storage 根（绝大多数登记的会是绝对路径）
+    inline void notePathForRoot(const std::string& p) { learnAbsolute(p); }
+
     inline bool nameForHandle(void* h, std::string& out) {
         Entry e;
         if (entryByHandle(h, e) && !e.name.empty()) { out = e.name; return true; }
@@ -709,10 +1164,14 @@ private:
     bool g_installedCode = false;
 
     int detourOpenV2(const char* filename, sqlite3** ppDb, int flags, const char* zVfs) {
-        int rc = g_origOpenV2 ? g_origOpenV2(filename, ppDb, flags, zVfs) : 1 /*SQLITE_ERROR*/;
-        if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr && *filename != '\0') {
-            noteOpened((void*)*ppDb, std::string(filename));
-        }
+        const int rc = g_origOpenV2 ? g_origOpenV2(filename, ppDb, flags, zVfs) : 1 /*SQLITE_ERROR*/;
+        // 登记逻辑包 try：任何异常都吞掉（穿进微信 = abort）
+        try {
+            if (!t_inOwnOpen && rc == 0 && ppDb != nullptr && *ppDb != nullptr
+                && filename != nullptr && *filename != '\0') {
+                noteOpened((void*)*ppDb, std::string(filename));
+            }
+        } catch (...) { }
         return rc;
     }
 
@@ -731,10 +1190,12 @@ private:
     bool g_installedOpenV1 = false;
 
     int detourOpen(const char* filename, sqlite3** ppDb) {
-        int rc = g_origOpen ? g_origOpen(filename, ppDb) : 1 /*SQLITE_ERROR*/;
-        if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr && *filename != '\0') {
-            noteOpened((void*)*ppDb, std::string(filename));
-        }
+        const int rc = g_origOpen ? g_origOpen(filename, ppDb) : 1 /*SQLITE_ERROR*/;
+        try {
+            if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr && *filename != '\0') {
+                noteOpened((void*)*ppDb, std::string(filename));
+            }
+        } catch (...) { }
         return rc;
     }
 
@@ -750,17 +1211,19 @@ private:
     bool g_installedOpen16 = false;
 
     int detourOpen16(const void* filename, sqlite3** ppDb) {
-        int rc = g_origOpen16 ? g_origOpen16(filename, ppDb) : 1 /*SQLITE_ERROR*/;
-        // filename 是 UTF-16LE；用 WideCharToMultiByte 转成 UTF-8 再交给 noteOpened
-        if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr) {
-            char buf[512];
-            int n = ::WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)filename, -1,
-                                          buf, (int)sizeof(buf) - 1, nullptr, nullptr);
-            if (n > 1) {
-                buf[n - 1] = '\0';              // 去掉结尾的 \0
-                noteOpened((void*)*ppDb, std::string(buf));
+        const int rc = g_origOpen16 ? g_origOpen16(filename, ppDb) : 1 /*SQLITE_ERROR*/;
+        try {
+            // filename 是 UTF-16LE；转成 UTF-8 再交给 noteOpened
+            if (rc == 0 && ppDb != nullptr && *ppDb != nullptr && filename != nullptr) {
+                char buf[512];
+                int n = ::WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)filename, -1,
+                                              buf, (int)sizeof(buf) - 1, nullptr, nullptr);
+                if (n > 1) {
+                    buf[n - 1] = '\0';
+                    noteOpened((void*)*ppDb, std::string(buf));
+                }
             }
-        }
+        } catch (...) { }
         return rc;
     }
 
@@ -1617,6 +2080,38 @@ private:
     //  推送通道（msgpush，默认关）是唯一例外：开关打开时才会解析 SQL 做标记，
     //  这里用一次 relaxed 原子读把它挡在门外。
     // ══════════════════════════════════════════════════════════════════
+    // 单独的记账函数（C++ 异常兜底）。
+    //  为什么单独拆出来：detourPrepare 里已经用了 __try/__except（SEH），
+    //  MSVC 规定一个函数只能用一种异常处理方式（C2713），所以
+    //  C++ try/catch 必须放到别的函数里。
+    /**
+     * 语句自动收尾（RAII）。
+     *
+     * 为什么必须有：execute 的 step 循环里只要抛一次异常（比如 nlohmann 的
+     * type_error.316），原来的代码就会直接 return，**跳过 finalize** →
+     * sqlite 语句泄漏 → 占着 message_0.db 的读锁 → 客户端自己写不进消息库。
+     * 症状：微信界面停在最后一条、机器人收不到任何新消息、发送 rc=0 但不落库。
+     */
+    struct StmtGuard {
+        sqlite3_api_routines* api;
+        sqlite3_stmt* stmt;
+        StmtGuard(sqlite3_api_routines* a, sqlite3_stmt* s) : api(a), stmt(s) {}
+        ~StmtGuard() {
+            if (stmt != nullptr && api != nullptr && api->finalize != nullptr) {
+                try { api->finalize(stmt); } catch (...) { }
+            }
+        }
+        void release() { stmt = nullptr; }
+    };
+
+    inline void safeNoteHotAndProbe(sqlite3* db, const char* sql, int n, int rc, sqlite3_stmt** stmt)
+    {
+        try { noteHot(db); } catch (...) { }
+        if (rc == SQLITE_OK && msgpush::enabled()) {
+            try { probe::maybeMark(db, sql, n, rc, stmt); } catch (...) { }
+        }
+    }
+
     int detourPrepare(sqlite3* db, const char* sql, int n, sqlite3_stmt** stmt, const char** tail) {
         if (g_WxVersion != 0) {   // 新版二分：只透传，不登记、不探针
             return g_origPrepare ? g_origPrepare(db, sql, n, stmt, tail) : 1;
@@ -1629,26 +2124,25 @@ private:
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             rc = SQLITE_MISUSE;           // 访问违例 → 当成句柄已失效，不往上抛
         }
-        noteHot(db);                      // 唯一动作（O(1)、无锁、无 API）
-        if (rc == SQLITE_OK && msgpush::enabled()) {
-            probe::maybeMark(db, sql, n, rc, stmt);   // 仅在推送通道打开时执行
-        }
+        safeNoteHotAndProbe(db, sql, n, rc, stmt);   // 记账（内部已做 C++ 异常兜底）
         return rc;
     }
 
     int detourPrepare16(sqlite3* db, const void* sql, int n, sqlite3_stmt** stmt, const void** tail) {
-        int rc = g_origPrepare16 ? g_origPrepare16(db, sql, n, stmt, tail) : 1;
-        noteHot(db);
-        if (rc == SQLITE_OK && msgpush::enabled()) probe::markFromSql16(db, sql, n, rc, stmt);
+        const int rc = g_origPrepare16 ? g_origPrepare16(db, sql, n, stmt, tail) : 1;
+        try { noteHot(db); } catch (...) { }
+        if (rc == SQLITE_OK && msgpush::enabled()) {
+            try { probe::markFromSql16(db, sql, n, rc, stmt); } catch (...) { }
+        }
         return rc;
     }
 
     int detourPrepareV3(sqlite3* db, const char* sql, int n, unsigned int flags,
                         sqlite3_stmt** stmt, const char** tail) {
-        int rc = g_origPrepareV3 ? g_origPrepareV3(db, sql, n, flags, stmt, tail) : 1;
-        noteHot(db);
+        const int rc = g_origPrepareV3 ? g_origPrepareV3(db, sql, n, flags, stmt, tail) : 1;
+        try { noteHot(db); } catch (...) { }
         if (rc == SQLITE_OK && msgpush::enabled()) {
-            probe::maybeMark(db, sql, n, rc, stmt);          // 实测消息写库走这个入口
+            try { probe::maybeMark(db, sql, n, rc, stmt); } catch (...) { }   // 实测消息写库走这个入口
         }
         return rc;
     }
@@ -1817,6 +2311,7 @@ private:
         j["vfs_null"] = (g_lastVfs.load() == 0);
         j["lock_ok"] = g_connLockOk.load(std::memory_order_relaxed);
         j["lock_null"] = g_connLockNull.load(std::memory_order_relaxed);
+        j["lock_serial"] = g_connLockSerial.load(std::memory_order_relaxed);   // 走退路串行锁的次数
         j["effective"] = (g_connLockOk.load(std::memory_order_relaxed) > 0);
         j["note"] = "effective=false 且 lock_null>0 → 这把锁没起作用（db_mutex 槽位不对/连接非 FULLMUTEX）";
         return j;
@@ -1947,6 +2442,12 @@ namespace xmgr {
 		size_t module_base = (size_t)g_hWeixinDll;
 		m_sqlite3Rountines = (sqlite3_api_routines*)(module_base + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
 		m_sqlcipherRountines = (sqlcipher_api_routines*)(module_base + XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET);
+        // ★ 2026-11-12：在 sqlcipher key() 上装"被动抄密钥"钩子。
+        //   客户端每开一个加密库都会调 key()，我们顺手把密钥字节记下来，
+        //   之后 ownConnectionFor 就能开自己的连接，彻底不碰客户端连接。
+        if (m_sqlcipherRountines != nullptr) {
+            db_registry::installKeyCapture(m_sqlcipherRountines);
+        }
 		m_codecGetKey = (sqlite3CodecGetKey)(module_base + XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC);
 		// 安装 open_v2 钩子：以后微信打开的每个数据库都会被登记（见文件开头 db_registry）。
 		// 这样就不必再靠"扫内存找指针值"——那种方式实测命中数会从 219 跳到 3，一跳就全废。
@@ -1969,6 +2470,58 @@ namespace xmgr {
 	}
 
 // ══════════════════════════════════════════════════════════════════
+	//  db_gate：客户端连接的"限流 + 退避"闸门（2026-11-12 方案 A）
+	//
+	//  背景：走客户端连接能拿到最新数据（WAL 内的消息），但客户端 sqlite 是
+	//        THREADSAFE=2（连接无互斥），我们并发用它的连接会踩内存，
+	//        实测会走到 Weixin.dll+0x3290 的 abort 桩。
+	//        压不住并发就压频率：每库最小间隔 300ms，连续失败 3 次退避 30 秒。
+	// ══════════════════════════════════════════════════════════════════
+	namespace db_gate {
+		struct Gate { long long lastMs = 0; int fail = 0; long long untilMs = 0; };
+		inline std::mutex& mtx() { static std::mutex m; return m; }
+		inline std::map<void*, Gate>& all() { static std::map<void*, Gate> g; return g; }
+
+		/**
+		 * 只做节流（每库最小间隔 300ms），**不做退避**。
+		 *
+		 * 历史：曾加过"连续失败 3 次 → 退避 30 秒"，实测误伤 ——
+		 *       桥的轮询 6 秒一轮，撞上 3 次失败就进 30 秒黑洞，
+		 *       面板自检的「hook 存活 / 数据库可读 / 消息轮询」全判红。
+		 *       崩溃根因（C++ 异常穿透）已用异常兜底修掉，不需要退避。
+		 */
+		inline bool waitAndCheck(void* h, std::string& why)
+		{
+			(void)why;
+			const long long now = db_registry::nowMs();
+			long long waitMs = 0;
+			{
+				std::lock_guard<std::mutex> lg(mtx());
+				Gate& g = all()[h];
+				if (g.lastMs > 0) {
+					waitMs = 300 - (now - g.lastMs);
+					if (waitMs < 0) waitMs = 0;
+					if (waitMs > 400) waitMs = 400;
+				}
+				g.lastMs = now + waitMs;
+			}
+			if (waitMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+			return true;
+		}
+
+		/** 记录结果（只维护计数，用于日志排查；不再触发退避） */
+		inline void mark(void* h, bool ok)
+		{
+			std::lock_guard<std::mutex> lg(mtx());
+			Gate& g = all()[h];
+			if (ok) { g.fail = 0; return; }
+			g.fail++;
+			if (g.fail == 3) db_registry::keycapLog("库 %p 连续失败 3 次（仅记录，不退避）", h);
+			if (g.fail > 3) g.fail = 3;
+		}
+	}   // namespace db_gate
+
+// ══════════════════════════════════════════════════════════════════
 	//  方案 A：自开只读连接（不碰客户端连接 → 从根上避免并发踩内存）
 	//
 	//  背景：这个微信的 sqlite 是 THREADSAFE=2（multi-thread），连接**没有互斥锁**
@@ -1983,14 +2536,50 @@ namespace xmgr {
 		if (clientDb == nullptr || m_sqlite3Rountines == nullptr) return nullptr;
 		if (m_sqlite3Rountines->db_filename == nullptr || m_sqlite3Rountines->open_v2 == nullptr) return nullptr;
 
+		// ① 优先：open 时记下来的完整绝对路径（最可靠）
+		std::string fullPath;
+		if (db_registry::fullPathForHandle(clientDb, fullPath) && !fullPath.empty()) {
+			// 直接用，跳过下面的短名推断
+		}
+
 		std::string pathStr;
-		if (!db_registry::nameForHandle(clientDb, pathStr) || pathStr.empty()) {
+		if (!fullPath.empty()) {
+			pathStr = fullPath;                       // ★ 用完整绝对路径
+		} else if (!db_registry::nameForHandle(clientDb, pathStr) || pathStr.empty()) {
 		    const char* p0 = (const char*)m_sqlite3Rountines->db_filename(clientDb, "main");   // 最后兜底
 		    if (p0 == nullptr || *p0 == 0) return nullptr;
 		    pathStr = p0;
 		}
-		const char* path = pathStr.c_str();
+		// ★ 短名 → 绝对路径（拿不到就拒绝，绝不让 sqlite 帮我们在 CWD 建空库）
+		const std::string absPath = db_registry::resolveDbPath(pathStr);
+		if (absPath.empty()) {
+			db_registry::keycapLog("拒绝开自有连接（无法定位绝对路径）: %s", pathStr.c_str());
+			return nullptr;
+		}
+		const char* path = absPath.c_str();
 		if (path == nullptr || *path == '\0') return nullptr;
+
+		// ★★ 2026-11-12 关键保护：**只接受绝对路径，而且文件必须已存在。**
+		//
+		//  踩过的坑：db_filename() 有时返回的是相对文件名（如 "message_0.db"），
+		//  我们直接 open() → sqlite 在**当前工作目录**（客户端目录）新建了一个
+		//  0 字节空库，查询返回 page_count=0 / 0 张表。
+		//  现场证据：D:\wxhook\wx4110\4.1.10.27\ 下多出 contact.db、message_0.db（0 字节）。
+		//
+		//  所以：路径不是绝对路径 → 拒绝；文件不存在 → 拒绝（绝不让 sqlite 帮我们建新库）。
+		{
+			const bool hasDrive = (path[0] != 0 && path[1] == ':');
+			const bool hasSep = (path[0] == '\\' && path[1] == '\\');
+			if (!hasDrive && !hasSep) {
+				db_registry::keycapLog("拒绝开自有连接（不是绝对路径）: %s", path);
+				return nullptr;
+			}
+			DWORD attrs = GetFileAttributesA(path);
+			if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+				db_registry::keycapLog("拒绝开自有连接（文件不存在）: %s", path);
+				return nullptr;
+			}
+		}
 
 		std::lock_guard<std::mutex> lg(m_ownMtx);
 		auto it = m_ownDbs.find(path);
@@ -2003,10 +2592,31 @@ namespace xmgr {
 		}
 		const void* pKey = key2.data();
 		const int kLen = (int)key2.size();
+		// ★ 2026-11-12：先试 READONLY；WAL 库在只读下可能打不开，
+		//   再试一次 READWRITE —— 但那仍然是**我们自己的连接对象**，
+		//   与"借用客户端连接"完全不同（sqlite 的多连接靠文件锁协调，是安全的）。
+		// 进入"自有连接"作用域：期间 open/key 的 detour 不做登记、不抓密钥
+		db_registry::OwnOpenScope _ownScope;
+
+		// ★★ 2026-11-12 关键修正：**必须用 v1 的 open，不能用 open_v2**。
+		//
+		//  本项目自己的注释（install() 上方）已写明实测结论：
+		//     open        0x7FFB75078E20  ← 在 Weixin.dll 内（真实 sqlite）
+		//     open_v2     0x7FFC3D618DE0  ← 在**另一个模块**（WCDB 封装层），微信从不调用
+		//  我们之前拿 open_v2 开自己的连接 → 走到 WCDB 封装层那条死路，
+		//  实测**直接卡死**（req 文件不再被处理，日志停在"密钥配对成功"）。
+		//
+		//  改用 api->open（v1）：这是微信核心真正用来开库的入口，行为可预期。
 		sqlite3* own = nullptr;
-		int rc = m_sqlite3Rountines->open_v2(path, &own, 0x00000001 /*SQLITE_OPEN_READONLY*/, nullptr);
+		int rc = 1;
+		if (m_sqlite3Rountines->open != nullptr) {
+			rc = m_sqlite3Rountines->open(path, &own);
+		} else if (m_sqlite3Rountines->open_v2 != nullptr) {
+			rc = m_sqlite3Rountines->open_v2(path, &own, 0x00000001 /*READONLY*/, nullptr);
+		}
 		if (rc != 0 || own == nullptr) {
-			OutputDebugStringA("[own_db] open_v2(READONLY) 失败，回退客户端连接\n");
+			db_registry::keycapLog("自有连接打不开 %s rc=%d", path, rc);
+			if (own != nullptr) { try { m_sqlite3Rountines->close(own); } catch (...) {} }
 			return nullptr;
 		}
 		if (m_sqlcipherRountines != nullptr && m_sqlcipherRountines->key != nullptr) {
@@ -2020,8 +2630,20 @@ namespace xmgr {
 			return nullptr;
 		}
 
+		// 验证：真能 prepare 才算成功（密钥错/文件被锁都会在这里暴露）
+		{
+			sqlite3_stmt* probe = nullptr;
+			int prc = m_sqlite3Rountines->prepare((LPVOID)own, "SELECT 1", -1, &probe, 0);
+			if (prc != 0 || probe == nullptr) {
+				db_registry::keycapLog("自有连接验证失败 %s rc=%d → 丢弃", path, prc);
+				m_sqlite3Rountines->close(own);
+				return nullptr;
+			}
+			m_sqlite3Rountines->finalize(probe);
+		}
+
 		m_ownDbs[path] = own;
-		OutputDebugStringA((std::string("[own_db] 已开独立只读连接: ") + path + "\n").c_str());
+		db_registry::keycapLog("已开独立只读连接: %s", path);
 		return own;
 	}
 
@@ -2038,23 +2660,112 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 		}
 	}
 
+	/**
+	 * 把任意字节串洗成**合法 UTF-8**。
+	 *
+	 * 为什么必须有：微信库里 `message_content` / `source` 存着历史遗留的
+	 * GBK / 二进制内容（实测有 0xAF 这种孤立续字节）。nlohmann 构造 JSON 时
+	 * 会抛 type_error.316（incomplete UTF-8 string）→ 整个 execute 抛异常
+	 * → 队列不写结果文件 → 桥端一律"超时"。
+	 * 表现就是：面板自检「hook 存活 / 数据库可读 / 消息轮询」全红，
+	 * 轮询器也读不到消息（机器人静默失聪）。
+	 *
+	 * 处理：逐字节校验 UTF-8 序列；非法字节替换成 '?'（0x3F），
+	 * 保证长度不炸、JSON 一定能构造、文本内容仍可辨认。
+	 */
+	static std::string sanitizeUtf8(const std::string& in)
+	{
+		std::string out;
+		out.reserve(in.size());
+		const size_t n = in.size();
+		size_t i = 0;
+		while (i < n) {
+			const unsigned char c = (unsigned char)in[i];
+			size_t need = 0;
+			if (c < 0x80) need = 0;
+			else if ((c & 0xE0) == 0xC0) need = 1;
+			else if ((c & 0xF0) == 0xE0) need = 2;
+			else if ((c & 0xF8) == 0xF0) need = 3;
+			else { out.push_back('?'); i++; continue; }   // 非法起始字节
+
+			if (i + need >= n) { out.push_back('?'); i = n; break; }   // 截断
+			bool ok = true;
+			for (size_t k = 1; k <= need; k++) {
+				const unsigned char cc = (unsigned char)in[i + k];
+				if ((cc & 0xC0) != 0x80) { ok = false; break; }
+			}
+			if (!ok) { out.push_back('?'); i++; continue; }
+			out.append(in, i, need + 1);
+			i += need + 1;
+		}
+		return out;
+	}
+
 	nlohmann::ordered_json DatabaseMgr::execute(sqlite3* db, const std::string& sql)
 	{
         std::lock_guard<std::recursive_mutex> _lck(g_clientCallMutex);   // 串行化：避免 httplib 两个工作线程同时进客户端 sqlite
         db_registry::SqliteConnLock _conn(db);   // ★ 连接锁：与客户端线程互斥（根治 lookaside 损坏）
 
-        // 方案 A：只读 SQL 走我们自己的只读连接（不碰客户端连接）
+        // ══════════════════════════════════════════════════════════════════
+        //  ★★ 2026-11-12【方案 A】读路径走**客户端连接**（带限流/退避）
+        //
+        //  为什么从"自有连接"改回来：
+        //    · 自有连接确实不碰客户端连接、不崩；但它读到的是主文件里已
+        //      checkpoint 的旧快照，看不到 WAL（-wal 里才是最新消息）。
+        //      实测 Name2Id 只读到 9 条（客户端实际 25 条），
+        //      所有消息 real_sender_id 塌缩成同一个数 → 发送者全部映射失败
+        //      → 别人的话被挂到自己名下、机器人认不出自己。
+        //    · 数据正确 > 绝对不碰连接。所以读走客户端连接（数据新鲜），
+        //      用"限流 + 串行 + 失败退避"把并发崩溃压下去。
+        //
+        //  三道闸：
+        //    ① 每库最小间隔 300ms（把 5~8 次/秒 摊平）
+        //    ② 全局串行（g_clientCallMutex）
+        //    ③ 连续失败 3 次 → 该库退避 30 秒
+        //  想回到自有连接：设 WXHOOK_OWN_DB=1。
+        // ══════════════════════════════════════════════════════════════════
+        nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
+
+        const bool isReadSql = [&sql]() {
+            std::string s2;
+            for (char c : sql) {
+                if (!isspace((unsigned char)c)) s2.push_back((char)toupper((unsigned char)c));
+                if (s2.size() >= 6) break;
+            }
+            return s2 == "SELECT" || s2 == "PRAGMA" || s2 == "WITH" || s2 == "EXPLAIN";
+        }();
+
+        if (!isReadSql) {
+            rdata["status"] = -1;
+            rdata["desc"] = "只允许只读 SQL（SELECT/PRAGMA/WITH/EXPLAIN）";
+            return rdata;
+        }
+
+        static std::atomic<int> s_ownMode{ -1 };   // -1=未探测 0=客户端连接(A) 1=自有连接
+        if (s_ownMode.load(std::memory_order_relaxed) < 0) {
+            char b[8] = { 0 };
+            GetEnvironmentVariableA("WXHOOK_OWN_DB", b, sizeof(b));
+            s_ownMode.store((b[0] == '1') ? 1 : 0, std::memory_order_relaxed);
+            db_registry::keycapLog("读路径模式: %s",
+                (b[0] == '1') ? "自有连接(WXHOOK_OWN_DB=1)" : "客户端连接(方案A)");
+        }
+
         sqlite3* runDb = db;
         bool useOwn = false;
-        {
-            std::string s2;
-            for (char c : sql) { if (!isspace((unsigned char)c)) { s2.push_back((char)toupper((unsigned char)c)); } if (s2.size() >= 6) break; }
-            if (s2 == "SELECT" || s2 == "PRAGMA" || s2 == "WITH" || s2 == "EXPLAIN") {
-                if (sqlite3* own = ownConnectionFor(db)) { runDb = own; useOwn = true; }
+        if (s_ownMode.load(std::memory_order_relaxed) == 1) {
+            if (sqlite3* own = ownConnectionFor(db)) { runDb = own; useOwn = true; }
+        }
+
+        // ① + ③：限流与退避（只在走客户端连接时启用）
+        if (!useOwn) {
+            std::string why;
+            if (!db_gate::waitAndCheck(db, why)) {
+                rdata["status"] = -1;
+                rdata["desc"] = why;
+                return rdata;
             }
         }
         db_registry::rearm(m_sqlite3Rountines);   // 每次查询补装钩子（幂等）
-		nlohmann::ordered_json rdata = { {"status",0},{"desc",""} };
 		if (db == nullptr) {
 			rdata["status"] = -1;
 			rdata["desc"] = "input db handle is nullptr";
@@ -2062,10 +2773,13 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 		}
 		sqlite3_stmt* stmt = nullptr;
 		int rc = m_sqlite3Rountines->prepare((LPVOID)runDb, sql.c_str(), -1, &stmt, 0);
+		// ★ 无论后面怎么 return / 抛异常，语句都会被 finalize（释放读锁）
+		db_registry::StmtGuard _stmtGuard(m_sqlite3Rountines, stmt);
 		// ★★ 句柄好坏的**唯一**判据就在这里：真实查询的返回码。
 		//    我们不主动去试句柄；只有真实查询（桥发来的 SQL / 取名扫描 / backup）
 		//    返回连接级错误时，才给这个句柄记一次失败；成功一次就清零。
 		db_registry::noteQueryResult((void*)db, rc);
+		if (!useOwn && rc == SQLITE_OK) db_gate::mark((void*)db, true);   // ★ 成功清零
 		if (rc != SQLITE_OK && useOwn && runDb != db) {
 		    // 独立连接失败（WAL 锁 / 密钥 / 只读限制）→ 丢弃缓存，回退客户端连接重试一次
 		    forgetOwn(db);
@@ -2074,6 +2788,7 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 		    rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
 		}
 		if (rc != SQLITE_OK) {
+			if (!useOwn) db_gate::mark((void*)db, false);   // ★ 连续失败 → 退避
 			rdata["status"] = rc;
 			rdata["desc"] = format_string("execute %s failed", "sqlite3_prepare");
 			return rdata;
@@ -2101,7 +2816,9 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 				}
 				default:
 				{
-					value = std::string((char*)pReadBlobData, nLength);
+					// ★ 2026-11-12：文本列必须洗成合法 UTF-8，否则 nlohmann
+					//   抛 type_error.316 → 队列不写结果 → 桥端超时 → 自检全红。
+					value = sanitizeUtf8(std::string((char*)pReadBlobData, nLength));
 					break;
 				}
 				}
@@ -2109,6 +2826,7 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 			}
 			items.push_back(item);
 		}
+		_stmtGuard.release();                          // 交回守卫，下面手动收尾
 		m_sqlite3Rountines->finalize(stmt);
 		if (stepRc != SQLITE_DONE && stepRc != SQLITE_OK) {
 			db_registry::noteQueryResult((void*)db, stepRc);   // 执行期才暴露的连接级错误
@@ -2175,7 +2893,8 @@ void DatabaseMgr::forgetOwn(sqlite3* clientDb) {
 		char* pKey = nullptr;
 		int iLen = 0;
 		std::string szKey;
-		return szKey;
+		// ★ 2026-11-11 可行性修复：codec 偏移不可靠 → 先验证再调（失败一次永久禁用）
+		if (true) return szKey;   // 保守：这条内部路径默认关（可用 db_registry::keyForPath 的缓存）
 		if (m_codecGetKey == nullptr)
 			return szKey;
 		nlohmann::ordered_json queryResult = execute(db, std::string("PRAGMA cipher_store_pass"));

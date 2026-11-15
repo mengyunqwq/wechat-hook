@@ -5,7 +5,8 @@
 #include "tools.h"
 #include "version_proxy.h"
 #include "hideself.h"
-#include "global.h"
+#include "global.h"
+#include "CrashLog.h"
 
 void InitIlinkProxy(HMODULE self);   // ilink_wrapper 代理（4.1.15.56+ 注入点）
 
@@ -164,6 +165,8 @@ BOOL APIENTRY DllMain(
 
         if (!_isNewWx) InitRealDll();   // 新版空跑：连真实 version 绑定也先跳过
 
+
+        crashlog::Install();   // 崩溃现场记录（VEH：只观察，不改客户端行为）
 
         if (!IsMainWeixinProcess())
         {

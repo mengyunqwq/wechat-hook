@@ -1,3 +1,4 @@
+#include "CrashLog.h"
 #include "httplib.h"
 #include "json.hpp"
 #include <windows.h>
@@ -72,6 +73,7 @@ void Route_SendTextMsg(httplib::Server& svr)
 
             OutputDebugStringA(("Decode_Pic src_path: " + src_path + "\n").c_str());
             OutputDebugStringA(("Decode_Pic dst_path: " + dst_path + "\n").c_str());
+            crashlog::Note("Decode_Pic src=%.60s", src_path.c_str());
 
 
             WeixinSend::DecodePic(src_path, dst_path);

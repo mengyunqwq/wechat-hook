@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -92,6 +92,9 @@
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
     </ClCompile>
     <Link>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)version.map</MapFileName>
+      <AdditionalOptions>/MAP:$(OutDir)version.map /MAPINFO:EXPORTS %(AdditionalOptions)</AdditionalOptions>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
@@ -137,6 +140,8 @@
       <EnableUAC>false</EnableUAC>
       <ModuleDefinitionFile>version.def</ModuleDefinitionFile>
       <LinkIncremental>true</LinkIncremental>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)version.map</MapFileName>
       <AdditionalLibraryDirectories>.\lib</AdditionalLibraryDirectories>
       <AdditionalDependencies>psapi.lib;gdiplus.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>LIBCMT</IgnoreSpecificDefaultLibraries>
@@ -216,11 +221,14 @@
     <ClCompile Include="src\HookManager.cpp" />
     <ClCompile Include="src\Hook_Method.cpp" />
     <ClCompile Include="src\global.cpp" />
+
+    <ClCompile Include="src\CrashLog.cpp" />
     <ClCompile Include="src\hideself.cpp" />
     <ClCompile Include="src\hook_xlog.cpp" />
     <ClCompile Include="src\httplib_core.cpp" />
     <ClCompile Include="src\http_post.cpp" />
     <ClCompile Include="src\http_routes.cpp" />
+    <ClCompile Include="src\HookQueue.cpp" />
     <ClCompile Include="src\ilink_proxy.cpp" />
     <ClCompile Include="src\http_server.cpp" />
     <ClCompile Include="src\inline_weixin_dll_load.cpp" />
@@ -231,6 +239,7 @@
     <ClCompile Include="src\SendImageMsg.cpp" />
     <ClCompile Include="src\SendTextMsg.cpp" />
     <ClCompile Include="src\SendVoiceMsg.cpp" />
+    <ClCompile Include="src\SendMoment.cpp" />
     <ClCompile Include="src\tools.cpp" />
     <ClCompile Include="src\wx_ini_reader.cpp" />
     <ClCompile Include="src\wx_send.cpp" />
